@@ -1,0 +1,108 @@
+[project]
+name = "fastapi-mcp-router"
+version = "0.1.0"
+description = "Lightweight FastAPI integration for Model Context Protocol (MCP)"
+requires-python = ">=3.10"
+license = "MIT"
+readme = "README.md"
+keywords = ["fastapi", "mcp", "model-context-protocol", "ai", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.134.0",
+    "pydantic>=2.12.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/rcrsr/fastapi-mcp-router"
+Repository = "https://github.com/rcrsr/fastapi-mcp-router"
+Issues = "https://github.com/rcrsr/fastapi-mcp-router/issues"
+
+[project.optional-dependencies]
+otel = ["opentelemetry-api>=1.0"]
+dev = [
+    "build>=1.4.0",
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.4",
+    "twine>=6.2.0",
+    "ty>=0.0.19",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = """
+    -v
+    --strict-markers
+    --strict-config
+    --cov=fastapi_mcp_router
+    --cov-report=term-missing
+    --cov-report=html:coverage/html
+    --cov-report=xml:coverage/coverage.xml
+    --cov-fail-under=80
+    --junitxml=reports/junit.xml
+"""
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["SIM102", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B008"]
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.src]
+exclude = ["tests/*"]
+
+[tool.coverage.run]
+source = ["fastapi_mcp_router"]
+omit = [
+    "*/tests/*",
+    "*/conftest.py",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
