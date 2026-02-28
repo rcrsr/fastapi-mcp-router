@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Testing & coverage
+.coverage
+coverage/
+reports/
+.pytest_cache/
+htmlcov/
+
+# Linting
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Conduct workflow artifacts
+conduct/
+
+# Code intelligence
+.codanna/
+.fastembed_*
+
+# Generated docs
+ARCHITECTURE.md
+
+# uv lock (library — consumers pin their own deps)
+uv.lock
