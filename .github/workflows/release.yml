@@ -38,7 +38,7 @@ jobs:
 
           VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 
-          if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+          if git ls-remote --tags origin "refs/tags/v${VERSION}" | grep -q "v${VERSION}"; then
             echo "Tag v${VERSION} already exists, skipping"
           else
             git tag -a "v${VERSION}" -m "Release v${VERSION}"
