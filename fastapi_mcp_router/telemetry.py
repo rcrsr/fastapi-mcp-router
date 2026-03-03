@@ -15,6 +15,24 @@ except ImportError:
     _otel_metrics = None
 
 
+def _get_otel_provider(enable: bool, module: object, factory: str) -> object:
+    """Return an OTel provider instance, or None when unavailable.
+
+    Args:
+        enable: When False, returns None immediately.
+        module: The imported OTel module, or None if not installed.
+        factory: Name of the factory method to call on the module.
+
+    Returns:
+        The OTel provider instance, or None if disabled or unavailable.
+    """
+    if not enable:
+        return None
+    if module is None:
+        return None
+    return getattr(module, factory)("fastapi-mcp-router")
+
+
 def get_tracer(enable: bool) -> object:
     """Return an OpenTelemetry tracer, or None when tracing is unavailable.
 
@@ -31,11 +49,7 @@ def get_tracer(enable: bool) -> object:
         ...     with tracer.start_as_current_span("my-span"):
         ...         pass
     """
-    if not enable:
-        return None
-    if _otel_trace is None:
-        return None
-    return _otel_trace.get_tracer("fastapi-mcp-router")
+    return _get_otel_provider(enable, _otel_trace, "get_tracer")
 
 
 def get_meter(enable: bool) -> object:
@@ -53,8 +67,4 @@ def get_meter(enable: bool) -> object:
         >>> if meter is not None:
         ...     counter = meter.create_counter("requests")
     """
-    if not enable:
-        return None
-    if _otel_metrics is None:
-        return None
-    return _otel_metrics.get_meter("fastapi-mcp-router")
+    return _get_otel_provider(enable, _otel_metrics, "get_meter")

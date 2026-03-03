@@ -10,22 +10,6 @@ from fastapi.testclient import TestClient
 
 from fastapi_mcp_router import MCPToolRegistry, create_mcp_router
 
-# Test fixtures
-
-
-@pytest.fixture(name="registry")
-def registry_fixture() -> MCPToolRegistry:
-    """Create tool registry with test tool."""
-    registry = MCPToolRegistry()
-
-    @registry.tool()
-    async def ping() -> str:
-        """Simple ping tool."""
-        return "pong"
-
-    return registry
-
-
 # Helper functions
 
 
@@ -50,11 +34,31 @@ def make_jsonrpc_request(
 
 
 @pytest.mark.integration
-def test_auth_validator_rejects_invalid_api_key(registry: MCPToolRegistry):
-    """Test auth_validator rejects requests with invalid API key."""
+@pytest.mark.parametrize(
+    "extra_headers,expected_status,expected_key",
+    [
+        ({"X-API-Key": "invalid-key"}, 401, "error"),
+        ({"X-API-Key": "valid-key"}, 200, "result"),
+        ({"Authorization": "Bearer invalid-token"}, 401, "error"),
+        ({"Authorization": "Bearer valid-token"}, 200, "result"),
+    ],
+    ids=[
+        "rejects_invalid_api_key",
+        "accepts_valid_api_key",
+        "rejects_invalid_bearer_token",
+        "accepts_valid_bearer_token",
+    ],
+)
+def test_auth_validator_credential_scenarios(
+    registry: MCPToolRegistry,
+    extra_headers: dict[str, str],
+    expected_status: int,
+    expected_key: str,
+) -> None:
+    """Test auth_validator accepts/rejects API key and bearer token credentials."""
 
     async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
-        """Validate that API key is 'valid-key'."""
+        """Validate that API key is 'valid-key' or bearer token is 'valid-token'."""
         if api_key:
             return api_key == "valid-key"
         if bearer_token:
@@ -67,116 +71,14 @@ def test_auth_validator_rejects_invalid_api_key(registry: MCPToolRegistry):
     client = TestClient(app)
 
     request = make_jsonrpc_request(method="ping")
-    response = client.post(
-        "/mcp",
-        json=request,
-        headers={
-            "MCP-Protocol-Version": "2025-06-18",
-            "X-API-Key": "invalid-key",
-        },
-    )
+    headers = {"MCP-Protocol-Version": "2025-06-18", **extra_headers}
+    response = client.post("/mcp", json=request, headers=headers)
 
-    assert response.status_code == 401
+    assert response.status_code == expected_status
     data = response.json()
-    assert "error" in data
-    assert "Authentication required" in data["error"]
-
-
-@pytest.mark.integration
-def test_auth_validator_accepts_valid_api_key(registry: MCPToolRegistry):
-    """Test auth_validator accepts requests with valid API key."""
-
-    async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
-        """Validate that API key is 'valid-key'."""
-        if api_key:
-            return api_key == "valid-key"
-        if bearer_token:
-            return bearer_token == "valid-token"
-        return False
-
-    app = FastAPI()
-    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
-    app.include_router(mcp_router, prefix="/mcp")
-    client = TestClient(app)
-
-    request = make_jsonrpc_request(method="ping")
-    response = client.post(
-        "/mcp",
-        json=request,
-        headers={
-            "MCP-Protocol-Version": "2025-06-18",
-            "X-API-Key": "valid-key",
-        },
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert "result" in data
-
-
-@pytest.mark.integration
-def test_auth_validator_rejects_invalid_bearer_token(registry: MCPToolRegistry):
-    """Test auth_validator rejects requests with invalid bearer token."""
-
-    async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
-        """Validate that bearer token is 'valid-token'."""
-        if api_key:
-            return api_key == "valid-key"
-        if bearer_token:
-            return bearer_token == "valid-token"
-        return False
-
-    app = FastAPI()
-    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
-    app.include_router(mcp_router, prefix="/mcp")
-    client = TestClient(app)
-
-    request = make_jsonrpc_request(method="ping")
-    response = client.post(
-        "/mcp",
-        json=request,
-        headers={
-            "MCP-Protocol-Version": "2025-06-18",
-            "Authorization": "Bearer invalid-token",
-        },
-    )
-
-    assert response.status_code == 401
-    data = response.json()
-    assert "error" in data
-    assert "Authentication required" in data["error"]
-
-
-@pytest.mark.integration
-def test_auth_validator_accepts_valid_bearer_token(registry: MCPToolRegistry):
-    """Test auth_validator accepts requests with valid bearer token."""
-
-    async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
-        """Validate that bearer token is 'valid-token'."""
-        if api_key:
-            return api_key == "valid-key"
-        if bearer_token:
-            return bearer_token == "valid-token"
-        return False
-
-    app = FastAPI()
-    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
-    app.include_router(mcp_router, prefix="/mcp")
-    client = TestClient(app)
-
-    request = make_jsonrpc_request(method="ping")
-    response = client.post(
-        "/mcp",
-        json=request,
-        headers={
-            "MCP-Protocol-Version": "2025-06-18",
-            "Authorization": "Bearer valid-token",
-        },
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert "result" in data
+    assert expected_key in data
+    if expected_status == 401:
+        assert "Authentication required" in data["error"]
 
 
 @pytest.mark.integration

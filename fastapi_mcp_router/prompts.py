@@ -271,7 +271,7 @@ class PromptRegistry:
                 )
 
         try:
-            if inspect.iscoroutinefunction(defn.handler) or inspect.isasyncgenfunction(defn.handler):
+            if inspect.iscoroutinefunction(defn.handler):
                 result = await defn.handler(**call_args)
             else:
                 result = defn.handler(**call_args)

@@ -62,9 +62,6 @@ def test_mcperror_attributes_accessible():
         data={"context": "test"},
     )
 
-    assert hasattr(error, "code")
-    assert hasattr(error, "message")
-    assert hasattr(error, "data")
     assert error.code == -32603
     assert error.message == "Internal error"
     assert error.data is not None
@@ -265,8 +262,6 @@ def test_toolerror_attributes_accessible():
         details={"field": "email", "value": "invalid"},
     )
 
-    assert hasattr(error, "message")
-    assert hasattr(error, "details")
     assert error.message == "Validation failed"
     assert error.details is not None
     assert error.details["field"] == "email"
