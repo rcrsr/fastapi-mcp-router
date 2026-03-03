@@ -423,14 +423,18 @@ Pass an `auth_validator` callback to validate credentials on every request:
 
 ```python
 import secrets
+from typing import Any
 
 VALID_KEY = "sk-production-key"
 
-async def auth_validator(api_key: str | None, bearer_token: str | None) -> bool:
+async def auth_validator(api_key: str | None, bearer_token: str | None) -> Any:
     if api_key:
-        return secrets.compare_digest(api_key, VALID_KEY)
+        if not secrets.compare_digest(api_key, VALID_KEY):
+            return False
+        return True
     if bearer_token:
-        return await validate_oauth_token(bearer_token)
+        claims = await validate_oauth_token(bearer_token)  # returns dict or None
+        return claims  # dict stored at request.state.auth_context
     return False
 
 mcp = MCPRouter(auth_validator=auth_validator)
@@ -441,7 +445,24 @@ The callback receives:
 - `api_key`: value from the `X-API-Key` header, or `None`
 - `bearer_token`: token from the `Authorization: Bearer <token>` header, or `None`
 
-When authentication fails, the endpoint returns HTTP 401 with a `WWW-Authenticate` header pointing to the PRM URL (if configured).
+**Return value semantics:**
+
+- Return a falsy value (`None`, `False`, `0`, `""`, `[]`) — the request is rejected with HTTP 401.
+- Return any truthy value — the request proceeds and the value is stored at `request.state.auth_context`.
+- Return `True` — backward-compatible path; `request.state.auth_context` is `True`.
+- Return a dict (e.g. decoded JWT claims) — `request.state.auth_context` holds the dict, accessible in tool handlers:
+
+```python
+@registry.tool()
+async def my_tool(request: Request) -> str:
+    ctx = request.state.auth_context  # dict with claims, or True
+    user_id = ctx.get("sub") if isinstance(ctx, dict) else None
+    return f"Hello {user_id}"
+```
+
+When no `auth_validator` is configured, `request.state.auth_context` is not set.
+
+When authentication fails, the endpoint returns HTTP 401 with a `WWW-Authenticate` header. If a PRM (Protected Resource Metadata) URL is configured, the header references that URL; otherwise the header is `WWW-Authenticate: Bearer realm="mcp"`.
 
 ### Tool Filtering
 

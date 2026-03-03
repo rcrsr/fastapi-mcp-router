@@ -396,6 +396,232 @@ def test_auth_validator_and_rate_limit_work_together(registry: MCPToolRegistry):
     assert response.status_code == 429
 
 
+# Auth validator falsy/truthy return value tests
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "falsy_value",
+    [None, False, 0, "", []],
+    ids=["None", "False", "0", "empty_str", "empty_list"],
+)
+def test_auth_validator_falsy_return_yields_401(registry: MCPToolRegistry, falsy_value: object):
+    """EC-1: Validator returning any falsy value returns 401 with WWW-Authenticate header.
+
+    AC-1: None → 401 + WWW-Authenticate.
+    AC-2: False → 401 + WWW-Authenticate.
+    EC-1: All falsy values (None, False, 0, "", []) trigger 401.
+    """
+
+    async def validate_auth(api_key: str | None, bearer_token: str | None) -> object:
+        """Return the parametrized falsy value unconditionally."""
+        return falsy_value
+
+    app = FastAPI()
+    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app)
+
+    body = make_jsonrpc_request(method="ping")
+    response = client.post(
+        "/mcp",
+        json=body,
+        headers={
+            "MCP-Protocol-Version": "2025-06-18",
+            "X-API-Key": "any-key",
+        },
+    )
+
+    assert response.status_code == 401
+    assert "WWW-Authenticate" in response.headers
+    assert 'Bearer realm="mcp"' in response.headers["WWW-Authenticate"]
+
+
+@pytest.mark.integration
+def test_auth_validator_returns_none_yields_401_with_www_authenticate(registry: MCPToolRegistry):
+    """AC-1: Validator returning None → 401 with WWW-Authenticate header."""
+
+    async def validate_auth(api_key: str | None, bearer_token: str | None) -> None:
+        """Return None unconditionally."""
+        return None
+
+    app = FastAPI()
+    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app)
+
+    body = make_jsonrpc_request(method="ping")
+    response = client.post(
+        "/mcp",
+        json=body,
+        headers={
+            "MCP-Protocol-Version": "2025-06-18",
+            "Authorization": "Bearer some-token",
+        },
+    )
+
+    assert response.status_code == 401
+    assert "WWW-Authenticate" in response.headers
+
+
+@pytest.mark.integration
+def test_auth_validator_returns_false_yields_401_with_www_authenticate(registry: MCPToolRegistry):
+    """AC-2: Validator returning False → 401 with WWW-Authenticate header."""
+
+    async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
+        """Return False unconditionally."""
+        return False
+
+    app = FastAPI()
+    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app)
+
+    body = make_jsonrpc_request(method="ping")
+    response = client.post(
+        "/mcp",
+        json=body,
+        headers={
+            "MCP-Protocol-Version": "2025-06-18",
+            "Authorization": "Bearer some-token",
+        },
+    )
+
+    assert response.status_code == 401
+    assert "WWW-Authenticate" in response.headers
+
+
+@pytest.mark.integration
+def test_auth_validator_returns_dict_stores_auth_context():
+    """AC-3: Validator returning dict → request.state.auth_context == returned dict.
+
+    Uses a tool that reads request.state.auth_context and stores it in a shared
+    dict. The tool provides an explicit input_schema to bypass Pydantic schema
+    generation for the Request-typed parameter.
+    """
+    from fastapi import Request
+
+    expected_context = {"user_id": "user-42", "scopes": ["read", "write"]}
+    captured: dict[str, object] = {}
+
+    registry = MCPToolRegistry()
+
+    @registry.tool(input_schema={"type": "object", "properties": {}, "required": []})
+    async def get_auth_context(request: Request) -> str:
+        """Read auth_context from request.state for assertion."""
+        ctx = getattr(request.state, "auth_context", None)
+        captured["auth_context"] = ctx
+        return "ok"
+
+    async def validate_auth(api_key: str | None, bearer_token: str | None) -> dict[str, object]:
+        """Return a dict as auth context."""
+        return expected_context
+
+    app = FastAPI()
+    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app)
+
+    body = make_jsonrpc_request(
+        method="tools/call",
+        params={"name": "get_auth_context", "arguments": {}},
+    )
+    response = client.post(
+        "/mcp",
+        json=body,
+        headers={
+            "MCP-Protocol-Version": "2025-06-18",
+            "Authorization": "Bearer valid-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured.get("auth_context") == expected_context
+
+
+@pytest.mark.integration
+def test_auth_validator_returns_true_stores_auth_context_and_proceeds():
+    """AC-4: Validator returning True → request proceeds and auth_context == True.
+
+    Provides an explicit input_schema to bypass Pydantic schema generation
+    for the Request-typed parameter.
+    """
+    from fastapi import Request
+
+    captured: dict[str, object] = {}
+
+    registry = MCPToolRegistry()
+
+    @registry.tool(input_schema={"type": "object", "properties": {}, "required": []})
+    async def get_auth_context(request: Request) -> str:
+        """Capture auth_context from request.state."""
+        ctx = getattr(request.state, "auth_context", None)
+        captured["auth_context"] = ctx
+        return "ok"
+
+    async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
+        """Return True unconditionally."""
+        return True
+
+    app = FastAPI()
+    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app)
+
+    body = make_jsonrpc_request(
+        method="tools/call",
+        params={"name": "get_auth_context", "arguments": {}},
+    )
+    response = client.post(
+        "/mcp",
+        json=body,
+        headers={
+            "MCP-Protocol-Version": "2025-06-18",
+            "X-API-Key": "any-key",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured.get("auth_context") is True
+
+
+@pytest.mark.integration
+def test_auth_validator_raises_exception_returns_internal_error(registry: MCPToolRegistry):
+    """EC-2: Validator raises exception → internal error response.
+
+    The router's outer except-Exception handler catches errors from
+    auth_validator and returns HTTP 200 with a JSON-RPC internal error
+    (code -32603). FastAPI does not propagate the exception to a 500 response
+    because the exception is caught within the route handler.
+    """
+
+    async def validate_auth(api_key: str | None, bearer_token: str | None) -> bool:
+        """Always raise an unexpected error."""
+        raise RuntimeError("auth service unavailable")
+
+    app = FastAPI()
+    mcp_router = create_mcp_router(registry, auth_validator=validate_auth)
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app, raise_server_exceptions=False)
+
+    body = make_jsonrpc_request(method="ping")
+    response = client.post(
+        "/mcp",
+        json=body,
+        headers={
+            "MCP-Protocol-Version": "2025-06-18",
+            "X-API-Key": "any-key",
+        },
+    )
+
+    # The route handler catches the exception and returns a JSON-RPC internal error.
+    # HTTP status is 200 per JSON-RPC 2.0 convention (errors are protocol-level).
+    assert response.status_code == 200
+    data = response.json()
+    assert "error" in data
+    assert data["error"]["code"] == -32603
+
+
 # Header sanitization tests
 
 

@@ -1,13 +1,13 @@
 """Tests for ResourceRegistry, FileResourceProvider, and resource HTTP endpoints.
 
-Covers AC-22 through AC-94, EC-1 through EC-4, and IC-17.
+Covers AC-22 through AC-94, EC-1 through EC-4, IC-17, AC-5, and AC-6.
 """
 
 import inspect
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from fastapi_mcp_router import MCPToolRegistry, ResourceRegistry, create_mcp_router
 from fastapi_mcp_router.exceptions import MCPError
@@ -552,3 +552,197 @@ def test_list_resources_raises_32601_when_empty() -> None:
         registry.list_resources()
 
     assert exc_info.value.code == -32601
+
+
+# ---------------------------------------------------------------------------
+# AC-5: Resource handler with Depends() -> dependency injected, schema excludes param
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resource_depends_dependency_is_injected() -> None:
+    """AC-5: Depends() param is resolved and injected into the handler at call time."""
+    registry = ResourceRegistry()
+
+    def get_db() -> str:
+        """Return a fake database connection string."""
+        return "db://test"
+
+    @registry.resource("item://{id}", name="Item", description="Item by id")
+    async def get_item(id: str, db: str = Depends(get_db)) -> str:
+        """Return item using injected db connection."""
+        return f"{db}:{id}"
+
+    contents = await registry.read_resource("item://42")
+
+    assert contents.text == "db://test:42"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resource_depends_async_dependency_is_injected() -> None:
+    """AC-5: Async Depends() is awaited and injected into the handler."""
+    registry = ResourceRegistry()
+
+    async def get_service() -> str:
+        """Async dependency returning a service name."""
+        return "svc://live"
+
+    @registry.resource("svc://{name}", name="Service", description="Service by name")
+    async def get_svc(name: str, service: str = Depends(get_service)) -> str:
+        """Return service info."""
+        return f"{service}/{name}"
+
+    contents = await registry.read_resource("svc://payments")
+
+    assert contents.text == "svc://live/payments"
+
+
+@pytest.mark.unit
+def test_resource_depends_param_excluded_from_list_resources_metadata() -> None:
+    """AC-5: list_resources() metadata does not expose the Depends() parameter name."""
+    registry = ResourceRegistry()
+
+    def get_db() -> str:
+        """Return a fake database handle."""
+        return "db://test"
+
+    @registry.resource("order://{id}", name="Order", description="Order by id")
+    async def get_order(id: str, db: str = Depends(get_db)) -> str:
+        """Return order content."""
+        return f"order:{id}"
+
+    resources = registry.list_resources()
+
+    assert len(resources) == 1
+    r = resources[0]
+    # Resource metadata only contains protocol fields — no db param leaks through
+    assert r.uri == "order://{id}"
+    assert r.name == "Order"
+    assert r.description == "Order by id"
+    assert not hasattr(r, "db")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resource_depends_injected_via_http_endpoint() -> None:
+    """AC-5: Depends() dependency is resolved when resource is read through the HTTP endpoint."""
+    registry = ResourceRegistry()
+
+    def get_tenant() -> str:
+        """Return a fixed tenant identifier."""
+        return "tenant-abc"
+
+    @registry.resource("tenant://{key}", name="Tenant", description="Tenant value")
+    async def get_tenant_value(key: str, tenant: str = Depends(get_tenant)) -> str:
+        """Return tenant-scoped value."""
+        return f"{tenant}:{key}"
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/mcp",
+            json=_rpc("resources/read", {"uri": "tenant://config"}),
+            headers=_MCP_HEADERS,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "result" in body
+    contents = body["result"]["contents"]
+    assert contents[0]["text"] == "tenant-abc:config"
+
+
+# ---------------------------------------------------------------------------
+# AC-6: Resource handler without Depends() -> existing behavior unchanged
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resource_without_depends_behavior_unchanged() -> None:
+    """AC-6: Handler with no Depends() parameters still works correctly."""
+    registry = ResourceRegistry()
+
+    @registry.resource("plain://{slug}", name="Plain", description="Plain resource")
+    async def get_plain(slug: str) -> str:
+        """Return plain content."""
+        return f"plain:{slug}"
+
+    contents = await registry.read_resource("plain://hello")
+
+    assert contents.text == "plain:hello"
+
+
+@pytest.mark.unit
+def test_resource_without_depends_list_resources_unchanged() -> None:
+    """AC-6: list_resources() returns correct metadata for handlers without Depends()."""
+    registry = ResourceRegistry()
+
+    @registry.resource("doc://{id}", name="Doc", description="A document", mime_type="text/markdown")
+    async def get_doc(id: str) -> str:
+        """Return document content."""
+        return f"doc:{id}"
+
+    resources = registry.list_resources()
+
+    assert len(resources) == 1
+    assert resources[0].uri == "doc://{id}"
+    assert resources[0].name == "Doc"
+    assert resources[0].mime_type == "text/markdown"
+
+
+# ---------------------------------------------------------------------------
+# EC-3: Dependency raises exception -> error propagates to JSON-RPC response
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resource_depends_exception_propagates_from_registry() -> None:
+    """EC-3: When a Depends() dependency raises, the exception propagates from read_resource."""
+    registry = ResourceRegistry()
+
+    def failing_dep() -> str:
+        """Dependency that always fails."""
+        raise RuntimeError("dependency unavailable")
+
+    @registry.resource("dep://{id}", name="Dep", description="Dep resource")
+    async def get_dep(id: str, conn: str = Depends(failing_dep)) -> str:
+        """Return dep content."""
+        return f"dep:{id}"
+
+    with pytest.raises(RuntimeError, match="dependency unavailable"):
+        await registry.read_resource("dep://test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resource_depends_exception_returns_error_via_http() -> None:
+    """EC-3: Dependency exception during resources/read returns JSON-RPC error -32603."""
+    registry = ResourceRegistry()
+
+    def broken_dep() -> str:
+        """Dependency that raises unconditionally."""
+        raise ValueError("service unreachable")
+
+    @registry.resource("broken://{id}", name="Broken", description="Broken resource")
+    async def get_broken(id: str, svc: str = Depends(broken_dep)) -> str:
+        """Return broken content."""
+        return f"broken:{id}"
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/mcp",
+            json=_rpc("resources/read", {"uri": "broken://anything"}),
+            headers=_MCP_HEADERS,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "error" in body
+    assert body["error"]["code"] == -32603

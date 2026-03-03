@@ -1,15 +1,16 @@
 """Integration and unit tests for OAuth Protected Resource Metadata (PRM) endpoint.
 
-Tests AC-7, AC-8, AC-9, AC-10, AC-73, AC-74, EC-11, EC-12.
+Tests AC-7, AC-8, AC-9, AC-10, AC-12, AC-13, AC-14, AC-73, AC-74,
+EC-5, EC-6, EC-11, EC-12.
 Covers PRM endpoint correctness, WWW-Authenticate header injection, and
-ValueError guards on create_prm_router() and create_mcp_router().
+TypeError/ValueError guards on create_prm_router() and create_mcp_router().
 """
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from fastapi_mcp_router import MCPToolRegistry, create_mcp_router, create_prm_router
+from fastapi_mcp_router import InMemorySessionStore, MCPRouter, MCPToolRegistry, create_mcp_router, create_prm_router
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -167,6 +168,130 @@ def test_missing_authorization_servers_raises_value_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# EC-5 / EC-6: TypeError guards on create_prm_router() mutual exclusion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_both_mcp_and_metadata_raises_type_error() -> None:
+    """EC-5: create_prm_router raises TypeError when both mcp and oauth_resource_metadata are given."""
+    metadata: dict[str, object] = {
+        "resource": "https://api.example.io/mcp",
+        "authorization_servers": ["https://auth.example.io"],
+    }
+    with pytest.raises(TypeError, match="mcp and oauth_resource_metadata are mutually exclusive"):
+        create_prm_router(metadata, mcp=object())  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_neither_mcp_nor_metadata_raises_type_error() -> None:
+    """EC-6: create_prm_router raises TypeError when neither mcp nor oauth_resource_metadata is given."""
+    with pytest.raises(TypeError, match="one of mcp or oauth_resource_metadata is required"):
+        create_prm_router()
+
+
+# ---------------------------------------------------------------------------
+# AC-12: create_prm_router(mcp=router) derives metadata from MCPRouter instance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_prm_router_from_mcp_router_derives_resource_url() -> None:
+    """AC-12: create_prm_router(mcp=router) sets resource == base_url + '/mcp'."""
+    mcp = MCPRouter(
+        base_url="https://example.com",
+        oauth_resource_metadata={
+            "resource": "https://example.com/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+        },
+    )
+
+    prm_router = create_prm_router(mcp=mcp)
+
+    assert prm_router is not None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_create_prm_router_from_mcp_router_endpoint_returns_correct_metadata() -> None:
+    """AC-12: PRM endpoint derived from MCPRouter returns resource == base_url + '/mcp'."""
+    mcp = MCPRouter(
+        base_url="https://example.com",
+        oauth_resource_metadata={
+            "resource": "https://example.com/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+        },
+    )
+
+    app = FastAPI()
+    prm_router = create_prm_router(mcp=mcp)
+    app.include_router(prm_router)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/.well-known/oauth-protected-resource")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resource"] == "https://example.com/mcp"
+    assert body["authorization_servers"] == ["https://auth.example.com"]
+
+
+# ---------------------------------------------------------------------------
+# AC-13: create_prm_router(oauth_resource_metadata={...}) keyword form unchanged
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_create_prm_router_keyword_metadata_arg_returns_correct_endpoint() -> None:
+    """AC-13: create_prm_router(oauth_resource_metadata={...}) keyword form works unchanged."""
+    metadata: dict[str, object] = {
+        "resource": "https://api.example.io/mcp",
+        "authorization_servers": ["https://auth.example.io"],
+        "scopes_supported": ["mcp:read"],
+    }
+
+    app = FastAPI()
+    prm_router = create_prm_router(oauth_resource_metadata=metadata)
+    app.include_router(prm_router)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/.well-known/oauth-protected-resource")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resource"] == "https://api.example.io/mcp"
+    assert body["authorization_servers"] == ["https://auth.example.io"]
+    assert body["scopes_supported"] == ["mcp:read"]
+
+
+# ---------------------------------------------------------------------------
+# AC-14: Both mcp= and oauth_resource_metadata= with real MCPRouter → TypeError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_both_mcp_router_and_metadata_raises_type_error() -> None:
+    """AC-14: create_prm_router with real MCPRouter and metadata raises TypeError."""
+    mcp = MCPRouter(
+        base_url="https://example.com",
+        oauth_resource_metadata={
+            "resource": "https://example.com/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+        },
+    )
+    extra_metadata: dict[str, object] = {
+        "resource": "https://other.example.com/mcp",
+        "authorization_servers": ["https://auth.other.example.com"],
+    }
+
+    with pytest.raises(TypeError, match="mcp and oauth_resource_metadata are mutually exclusive"):
+        create_prm_router(oauth_resource_metadata=extra_metadata, mcp=mcp)
+
+
+# ---------------------------------------------------------------------------
 # AC-74 / EC-11: Both session_store and session_getter raises ValueError
 # ---------------------------------------------------------------------------
 
@@ -183,6 +308,6 @@ def test_both_session_store_and_getter_raises_value_error() -> None:
     with pytest.raises(ValueError, match="session_store"):
         create_mcp_router(
             registry,
-            session_store=object(),
+            session_store=InMemorySessionStore(),
             session_getter=session_getter,
         )

@@ -12,7 +12,7 @@ Classes:
 import json
 import types
 from collections.abc import AsyncGenerator, Callable
-from inspect import Parameter, signature
+from inspect import Parameter, iscoroutinefunction, signature
 from typing import TypeVar, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, TypeAdapter
@@ -348,8 +348,6 @@ class MCPToolRegistry:
         """
 
         def decorator(func: F) -> F:
-            # Import here to avoid circular dependency
-            from asyncio import iscoroutinefunction
             from inspect import isasyncgenfunction
 
             # Validate function is async (coroutine or async generator)
@@ -724,9 +722,6 @@ class MCPToolRegistry:
 
         # Execute tool handler with Request, BackgroundTasks, and Depends injection
         try:
-            # Import here to avoid circular dependency
-            from asyncio import iscoroutinefunction
-
             from fastapi import BackgroundTasks, Request
 
             sig = signature(tool.handler)

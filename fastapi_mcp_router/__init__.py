@@ -12,7 +12,7 @@ from fastapi_mcp_router.exceptions import MCPError, ToolError
 from fastapi_mcp_router.prompts import PromptRegistry
 from fastapi_mcp_router.registry import MCPToolRegistry
 from fastapi_mcp_router.resources import ResourceRegistry
-from fastapi_mcp_router.router import MCPRouter, ToolFilter, create_mcp_router, create_prm_router
+from fastapi_mcp_router.router import AuthValidator, MCPRouter, ToolFilter, create_mcp_router, create_prm_router
 from fastapi_mcp_router.session import InMemorySessionStore, SessionStore
 from fastapi_mcp_router.types import (
     EventSubscriber,
@@ -24,6 +24,7 @@ from fastapi_mcp_router.types import (
 )
 
 __all__ = [
+    "AuthValidator",
     "EventSubscriber",
     "InMemorySessionStore",
     "MCPError",

@@ -36,7 +36,7 @@ All parameters are keyword-only.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `auth_validator` | `AuthValidator \| None` | `None` | Callback `(api_key, bearer_token) -> bool` |
+| `auth_validator` | `AuthValidator \| None` | `None` | Callback `(api_key, bearer_token) -> Any`. Falsy return (e.g. `None`, `False`) → 401 with `WWW-Authenticate: Bearer` header. Truthy return → stored at `request.state.auth_context`. |
 | `session_store` | `SessionStore \| None` | `None` | Session persistence backend |
 | `session_getter` | `SessionGetter \| None` | `None` | Legacy session retrieval callback |
 | `session_creator` | `SessionCreator \| None` | `None` | Legacy session creation callback |
@@ -165,7 +165,7 @@ create_mcp_router(
 |-----------|------|---------|-------------|
 | `registry` | `MCPToolRegistry` | (required) | Tool registry |
 | `rate_limit_dependency` | `Callable \| None` | `None` | FastAPI rate limit dependency |
-| `auth_validator` | `AuthValidator \| None` | `None` | `(api_key, bearer_token) -> bool` |
+| `auth_validator` | `AuthValidator \| None` | `None` | Callback `(api_key, bearer_token) -> Any`. Falsy return (e.g. `None`, `False`) → 401 with `WWW-Authenticate: Bearer` header. Truthy return → stored at `request.state.auth_context`. |
 | `base_url` | `str \| None` | `None` | Base URL for PRM headers |
 | `session_getter` | `SessionGetter \| None` | `None` | Legacy session retrieval |
 | `session_creator` | `SessionCreator \| None` | `None` | Legacy session creation |
@@ -202,19 +202,48 @@ from fastapi_mcp_router import create_prm_router
 Creates a root-level router for the OAuth Protected Resource Metadata endpoint (RFC 9728).
 
 ```python
-create_prm_router(oauth_resource_metadata: dict[str, object]) -> APIRouter
+def create_prm_router(
+    mcp: MCPRouter | None = None,
+    oauth_resource_metadata: dict[str, object] | None = None,
+) -> APIRouter
 ```
 
-Registers `GET /.well-known/oauth-protected-resource`. Mount with no prefix:
+Registers `GET /.well-known/oauth-protected-resource`. Mount with no prefix.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mcp` | `MCPRouter \| None` | `None` | Derives PRM from an `MCPRouter` instance. Sets `resource` to `mcp.base_url + "/mcp"` and `authorization_servers` from `mcp.oauth_resource_metadata`. |
+| `oauth_resource_metadata` | `dict[str, object] \| None` | `None` | Explicit RFC 9728 PRM fields. Must include `resource` and `authorization_servers`. |
+
+Exactly one of `mcp` or `oauth_resource_metadata` must be provided.
+
+**Example — derive from MCPRouter:**
 
 ```python
-app.include_router(create_prm_router({
+mcp = MCPRouter(
+    base_url="https://api.example.com",
+    oauth_resource_metadata={
+        "resource": "https://api.example.com/mcp",
+        "authorization_servers": ["https://auth.example.com"],
+    },
+)
+app.include_router(mcp)
+app.include_router(create_prm_router(mcp=mcp))
+```
+
+**Example — explicit metadata (backward-compatible):**
+
+```python
+app.include_router(create_prm_router(oauth_resource_metadata={
     "resource": "https://api.example.com/mcp",
     "authorization_servers": ["https://auth.example.com"],
 }))
 ```
 
-**Raises:** `ValueError` if `resource` or `authorization_servers` keys are missing.
+**Raises:**
+- `TypeError("mcp and oauth_resource_metadata are mutually exclusive")` if both are provided
+- `TypeError("one of mcp or oauth_resource_metadata is required")` if neither is provided
+- `ValueError` if `resource` or `authorization_servers` keys are missing from the resolved metadata
 
 ---
 

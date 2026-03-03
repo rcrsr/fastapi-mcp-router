@@ -49,7 +49,7 @@ from fastapi_mcp_router.types import EventSubscriber, McpSessionData, ServerInfo
 logger = logging.getLogger(__name__)
 
 # Type alias for authentication validator callback
-AuthValidator = Callable[[str | None, str | None], Awaitable[bool]]
+AuthValidator = Callable[[str | None, str | None], Awaitable[Any]]
 
 # Type aliases for session management callbacks
 SessionGetter = Callable[[str], Awaitable[McpSessionData | None]]
@@ -225,7 +225,7 @@ def _validate_elicitation_content(content: object, schema: dict) -> None:
 async def _check_authentication(
     request: Request,
     auth_validator: AuthValidator | None = None,
-) -> tuple[str | None, str | None, bool]:
+) -> tuple[str | None, str | None, Any]:
     """
     Check authentication headers and validate credentials.
 
@@ -237,11 +237,13 @@ async def _check_authentication(
         auth_validator: Optional callback to validate credentials
 
     Returns:
-        Tuple of (api_key, bearer_token, is_valid) where:
+        Tuple of (api_key, bearer_token, auth_result) where:
         - api_key: Value from X-API-Key header or None
         - bearer_token: Token from Authorization Bearer header or None
-        - is_valid: True if authenticated (either credentials present when
-          no validator, or validator returned True)
+        - auth_result: The raw validator return value when a validator is
+          configured (truthy → authenticated; stored at
+          request.state.auth_context), or a bool when no validator is
+          configured (True if credentials are present, False otherwise)
 
     Note:
         Non-constant-time string comparison for "bearer " prefix is acceptable.
@@ -258,14 +260,16 @@ async def _check_authentication(
     has_bearer = auth_header.lower().startswith("bearer ")
     bearer_token = auth_header[7:].strip() if has_bearer else None
 
-    # If validator provided, use it to validate credentials
+    # If validator provided, capture the full return value
     if auth_validator is not None:
-        is_valid = await auth_validator(api_key, bearer_token)
+        auth_result = await auth_validator(api_key, bearer_token)
+        if auth_result:
+            request.state.auth_context = auth_result
     else:
         # Default behavior: just check presence (no actual validation)
-        is_valid = bool(api_key or has_bearer)
+        auth_result = bool(api_key or has_bearer)
 
-    return api_key, bearer_token, is_valid
+    return api_key, bearer_token, auth_result
 
 
 def create_mcp_router(
@@ -515,7 +519,7 @@ def create_mcp_router(
             # Require authentication: either X-API-Key or Authorization Bearer token
             if not is_valid:
                 logger.warning("Unauthenticated GET request to MCP endpoint")
-                response_headers: dict[str, str] = {}
+                response_headers: dict[str, str] = {"WWW-Authenticate": 'Bearer realm="mcp"'}
                 response_content: dict[str, object] = {
                     "error": "Authentication required",
                     "error_description": "Bearer token missing or invalid. Re-authenticate.",
@@ -947,7 +951,7 @@ def create_mcp_router(
             # Require authentication: either X-API-Key or Authorization Bearer token
             if not is_valid:
                 logger.warning("Unauthenticated POST request to MCP endpoint")
-                post_401_headers: dict[str, str] = {}
+                post_401_headers: dict[str, str] = {"WWW-Authenticate": 'Bearer realm="mcp"'}
                 post_401_content: dict[str, object] = {
                     "error": "Authentication required",
                     "error_description": "Bearer token missing or invalid. Re-authenticate.",
@@ -1383,7 +1387,7 @@ def create_mcp_router(
                         message="Method not found: resources/read",
                     )
                 uri = params.get("uri", "") if params else ""
-                contents = await resource_registry.read_resource(str(uri))
+                contents = await resource_registry.read_resource(str(uri), request=request)
                 result = {
                     "contents": [
                         {
@@ -1563,6 +1567,8 @@ class MCPRouter(APIRouter):
     Use ``app.include_router(mcp, prefix="/mcp")`` to mount endpoints.
 
     Attributes:
+        base_url: Base URL passed at construction (may be None).
+        oauth_resource_metadata: RFC 9728 PRM fields passed at construction (may be None).
         _tool_registry: Internal MCPToolRegistry for tool registration
         _resource_registry: Internal ResourceRegistry for resource registration
         _prompt_registry: Internal PromptRegistry for prompt registration
@@ -1634,6 +1640,8 @@ class MCPRouter(APIRouter):
 
         super().__init__()
 
+        self.base_url = base_url
+        self.oauth_resource_metadata = oauth_resource_metadata
         self._tool_registry = MCPToolRegistry()
         self._resource_registry = ResourceRegistry()
         self._prompt_registry = PromptRegistry()
@@ -1786,35 +1794,73 @@ class MCPRouter(APIRouter):
         self._resource_registry.register_provider(uri_prefix, provider)
 
 
-def create_prm_router(oauth_resource_metadata: dict[str, object]) -> APIRouter:
+def create_prm_router(
+    oauth_resource_metadata: dict[str, object] | None = None,
+    *,
+    mcp: "MCPRouter | None" = None,
+) -> APIRouter:
     """
     Create a root-level FastAPI router for the OAuth PRM endpoint.
 
     Registers GET /.well-known/oauth-protected-resource per RFC 9728. Mount
     this router on the main FastAPI app with no prefix so the path is absolute.
 
+    Exactly one of ``mcp`` or ``oauth_resource_metadata`` must be provided.
+    When ``mcp`` is provided, the metadata is derived from the router's
+    ``base_url`` and ``oauth_resource_metadata`` attributes.
+
     Args:
+        mcp: MCPRouter instance. Derives ``resource`` from ``mcp.base_url + "/mcp"``
+            and ``authorization_servers`` from ``mcp.oauth_resource_metadata``.
+            Mutually exclusive with ``oauth_resource_metadata``.
         oauth_resource_metadata: RFC 9728 Protected Resource Metadata dict.
             Must contain "resource" and "authorization_servers" keys.
+            Mutually exclusive with ``mcp``.
 
     Returns:
         APIRouter with GET /.well-known/oauth-protected-resource registered.
 
     Raises:
-        ValueError: If oauth_resource_metadata is missing "resource" or
+        TypeError: If both ``mcp`` and ``oauth_resource_metadata`` are provided.
+        TypeError: If neither ``mcp`` nor ``oauth_resource_metadata`` is provided.
+        ValueError: If the resolved metadata is missing "resource" or
             "authorization_servers" keys.
 
     Example:
         >>> from fastapi import FastAPI
-        >>> from fastapi_mcp_router import create_prm_router
+        >>> from fastapi_mcp_router import MCPRouter, create_prm_router
         >>>
         >>> app = FastAPI()
-        >>> prm_router = create_prm_router({
+        >>> mcp = MCPRouter(
+        ...     base_url="https://api.example.io",
+        ...     oauth_resource_metadata={
+        ...         "resource": "https://api.example.io/mcp",
+        ...         "authorization_servers": ["https://auth.example.io"],
+        ...     },
+        ... )
+        >>> prm_router = create_prm_router(mcp=mcp)
+        >>> app.include_router(prm_router)  # No prefix — path is absolute
+        >>>
+        >>> # Legacy call pattern still works:
+        >>> prm_router = create_prm_router(oauth_resource_metadata={
         ...     "resource": "https://api.example.io/mcp",
         ...     "authorization_servers": ["https://auth.example.io"],
         ... })
-        >>> app.include_router(prm_router)  # No prefix — path is absolute
+        >>> app.include_router(prm_router)
     """
+    if mcp is not None and oauth_resource_metadata is not None:
+        raise TypeError("mcp and oauth_resource_metadata are mutually exclusive")
+    if mcp is None and oauth_resource_metadata is None:
+        raise TypeError("one of mcp or oauth_resource_metadata is required")
+
+    if mcp is not None:
+        resource = f"{mcp.base_url}/mcp" if mcp.base_url is not None else None
+        mcp_metadata = mcp.oauth_resource_metadata or {}
+        oauth_resource_metadata = dict(mcp_metadata)
+        if resource is not None:
+            oauth_resource_metadata["resource"] = resource
+
+    assert oauth_resource_metadata is not None  # narrowing for type checker
     missing = [key for key in ("resource", "authorization_servers") if key not in oauth_resource_metadata]
     if missing:
         raise ValueError(f"oauth_resource_metadata is missing required keys: {missing}")
@@ -1964,9 +2010,9 @@ async def handle_tools_call(
 
     For stateful mode with a generator tool (is_generator=True) and an active
     session_store + session_id: the registry returns the raw AsyncGenerator.
-    The router iterates it via a background task, enqueueing each yielded dict
-    to the session so the SSE GET stream delivers them as notifications (AC-12).
-    The POST response returns an immediate ack so the client is not blocked.
+    The router collects all yielded dicts synchronously and returns them as a
+    list in the POST response body (IR-3). If the generator raises mid-iteration
+    the response contains isError: true with the error message (EC-4).
 
     For stateless mode or non-generator tools, behaviour is unchanged.
 
@@ -1981,11 +2027,11 @@ async def handle_tools_call(
             - arguments: Dictionary of tool arguments (optional, defaults to {})
         request: FastAPI Request object for dependency injection
         background_tasks: FastAPI BackgroundTasks for async task scheduling
-        session_store: Optional SessionStore for stateful streaming dispatch.
-            When provided with session_id, generator results are enqueued to
-            the session rather than collected into the POST response.
-        session_id: Active session ID for enqueue_message calls. Required when
-            session_store is provided and tool is a generator.
+        session_store: Optional SessionStore for stateful mode detection.
+            When provided with session_id, generator results are collected
+            synchronously and returned in the POST response (IR-3).
+        session_id: Active session ID. Required when session_store is provided
+            and tool is a generator.
         progress_callback: Optional ProgressCallback injected into tools that
             declare a ``progress: ProgressCallback`` parameter. In stateful mode
             this reports progress notifications via the session SSE stream and
@@ -2007,9 +2053,9 @@ async def handle_tools_call(
             ]
         }
 
-        Stateful generator ack structure (AC-12):
+        Stateful generator collected structure (IR-3):
         {
-            "content": [{"type": "text", "text": "Streaming results via SSE"}]
+            "content": [<dict>, ...]
         }
 
         Error result structure:
@@ -2070,7 +2116,7 @@ async def handle_tools_call(
     # Type narrowing for ty - after isinstance check, arguments is dict[str, object]
     tool_arguments: dict[str, object] = arguments  # type: ignore[assignment]
 
-    # Stateful generator mode: registry returns raw AsyncGenerator for background draining
+    # Stateful generator mode: registry returns raw AsyncGenerator for synchronous collection
     use_stateful_streaming = session_store is not None and session_id is not None
 
     # Call tool - may raise MCPError or ToolError
@@ -2085,58 +2131,18 @@ async def handle_tools_call(
             sampling_manager=sampling_manager,
         )
 
-        # AC-12: stateful generator — iterate in background, enqueue each dict as SSE event
+        # IR-3: stateful generator — collect all yielded items into a list for the POST response
         if use_stateful_streaming and hasattr(result, "__aiter__"):
             gen_result: AsyncGenerator[dict] = result  # type: ignore[assignment]
-            # Narrow away None for the type checker (use_stateful_streaming guarantees both set)
-            assert session_store is not None
-            assert session_id is not None
-
-            async def _drain_generator(
-                gen: AsyncGenerator[dict],
-                store: SessionStore,
-                sid: str,
-            ) -> None:
-                """Drain generator and enqueue each yielded dict to the session store."""
-                try:
-                    async for item in gen:
-                        if not isinstance(item, dict):
-                            logger.warning(
-                                "Generator tool yielded non-dict for session %s: %s",
-                                sid,
-                                type(item).__name__,
-                            )
-                            non_dict_text = f"Generator yielded non-dict: {type(item).__name__}"
-                            await store.enqueue_message(
-                                sid,
-                                {
-                                    "content": [{"type": "text", "text": non_dict_text}],
-                                    "isError": True,
-                                },
-                            )
-                            break
-                        await store.enqueue_message(sid, item)
-                except ToolError as drain_err:
-                    logger.warning("Generator ToolError for session %s: %s", sid, drain_err.message)
-                    await store.enqueue_message(
-                        sid,
-                        {
-                            "content": [{"type": "text", "text": drain_err.message}],
-                            "isError": True,
-                        },
-                    )
-                except Exception as drain_exc:
-                    logger.error("Generator exception for session %s: %s", sid, drain_exc, exc_info=True)
-                    await store.enqueue_message(
-                        sid,
-                        {
-                            "content": [{"type": "text", "text": str(drain_exc)}],
-                            "isError": True,
-                        },
-                    )
-
-            background_tasks.add_task(_drain_generator, gen_result, session_store, session_id)
-            return {"content": [{"type": "text", "text": "Streaming results via SSE"}]}
+            try:
+                collected = await registry._collect_generator(gen_result)
+            except ToolError as gen_err:
+                # EC-4: generator raised mid-iteration — return isError response
+                return {
+                    "content": [{"type": "text", "text": gen_err.message}],
+                    "isError": True,
+                }
+            return {"content": collected}
 
         # Pass through structured content if tool returned MCP wire format directly
         if isinstance(result, dict) and "structuredContent" in result:

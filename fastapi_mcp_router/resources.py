@@ -21,13 +21,52 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from inspect import iscoroutinefunction, signature
 from pathlib import Path
+from typing import get_args, get_origin
 
 from fastapi_mcp_router.exceptions import MCPError
 
 logger = logging.getLogger(__name__)
 
 _FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB in bytes
+
+
+def _is_type_or_contains_type(annotation: object, target_type: type, type_name: str) -> bool:
+    """Check if annotation is target_type or contains it in a Union.
+
+    Handles direct types, Union types (X | Y), and Optional types (X | None).
+    Uses both identity check and string name comparison for robustness.
+
+    Args:
+        annotation: Type annotation to check
+        target_type: Type class to search for (e.g., Request)
+        type_name: Simple type name for string comparison (e.g., "Request")
+
+    Returns:
+        True if annotation matches target_type or contains it in a Union
+    """
+    # Direct type match
+    if annotation is target_type:
+        return True
+
+    # String name match (handles different import sources)
+    if hasattr(annotation, "__name__") and annotation.__name__ == type_name:
+        return True
+
+    # Check for Union types (X | Y or Optional[X])
+    origin = get_origin(annotation)
+    if origin is not None:
+        args = get_args(annotation)
+        for arg in args:
+            if arg is type(None):
+                continue
+            if _is_type_or_contains_type(arg, target_type, type_name):
+                return True
+
+    return False
+
+
 _DEFAULT_ALLOWED_EXTENSIONS = {".txt", ".md", ".json", ".yaml"}
 
 
@@ -562,8 +601,6 @@ class ResourceRegistry:
         """
 
         def decorator(func: Callable) -> Callable:
-            from asyncio import iscoroutinefunction
-
             func_name = getattr(func, "__name__", repr(func))
             if not iscoroutinefunction(func):
                 raise TypeError(f"Resource handler {func_name} must be async. Add 'async def' to function definition.")
@@ -683,7 +720,7 @@ class ResourceRegistry:
             for defn in self._handlers
         ]
 
-    async def read_resource(self, uri: str) -> ResourceContents:
+    async def read_resource(self, uri: str, request: object = None) -> ResourceContents:
         """Invoke the handler or provider matching the URI.
 
         Matching order:
@@ -693,6 +730,7 @@ class ResourceRegistry:
 
         Args:
             uri: Resource URI to read
+            request: Optional FastAPI Request object for Depends() injection
 
         Returns:
             ResourceContents with text or blob content
@@ -712,7 +750,7 @@ class ResourceRegistry:
             if match is None:
                 continue
             kwargs = match.groupdict()
-            return await _invoke_handler(defn, uri, kwargs)
+            return await _invoke_handler(defn, uri, kwargs, request=request)
 
         # Try provider-based entries
         for prefix, provider in self._providers:
@@ -731,13 +769,18 @@ async def _invoke_handler(
     defn: _ResourceDefinition,
     uri: str,
     kwargs: dict[str, str],
+    request: object = None,
 ) -> ResourceContents:
     """Call a function-based resource handler and normalize its return value.
+
+    Resolves FastAPI Depends() parameters from the handler signature before
+    invocation, injecting the optional Request into dependencies that need it.
 
     Args:
         defn: Resource definition containing handler and metadata
         uri: Original request URI (used in returned ResourceContents)
         kwargs: Matched URI parameters to pass as keyword arguments
+        request: Optional FastAPI Request object for Depends() injection
 
     Returns:
         ResourceContents built from the handler's return value
@@ -746,8 +789,38 @@ async def _invoke_handler(
         MCPError: -32603 if the handler raises an unexpected exception
         MCPError: -32603 if the handler returns an unsupported type
     """
+    # Resolve Depends() OUTSIDE try — exceptions propagate per EC-3
+    from fastapi import Request
+
+    call_kwargs: dict[str, object] = dict(kwargs)
+    handler_sig = signature(defn.handler)
+
+    for param_name, param in handler_sig.parameters.items():
+        if not (hasattr(param.default, "__class__") and param.default.__class__.__name__ == "Depends"):
+            continue
+
+        dependency_fn = param.default.dependency
+        if dependency_fn is None:
+            continue
+
+        dep_sig = signature(dependency_fn)
+        dep_kwargs: dict[str, object] = {}
+
+        for dep_param_name, dep_param in dep_sig.parameters.items():
+            if _is_type_or_contains_type(dep_param.annotation, Request, "Request"):
+                if request is not None:
+                    dep_kwargs[dep_param_name] = request
+
+        if iscoroutinefunction(dependency_fn):
+            resolved = await dependency_fn(**dep_kwargs)
+        else:
+            resolved = dependency_fn(**dep_kwargs)
+
+        call_kwargs[param_name] = resolved
+
+    # Only handler invocation inside try
     try:
-        result = await defn.handler(**kwargs)
+        result = await defn.handler(**call_kwargs)
     except MCPError:
         raise
     except Exception as e:

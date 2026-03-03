@@ -368,8 +368,8 @@ async def test_generator_raises_produces_tool_error() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_stateful_generator_enqueues_dicts_to_session() -> None:
-    """AC-12: Stateful POST tools/call enqueues each yielded dict to the session store."""
+async def test_stateful_generator_collects_dicts_in_response() -> None:
+    """IR-3: Stateful POST tools/call collects all yielded dicts into the POST response body."""
     registry = MCPToolRegistry()
 
     @registry.tool()
@@ -401,16 +401,11 @@ async def test_stateful_generator_enqueues_dicts_to_session() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert "result" in body
-    # Stateful generator: POST returns immediate ack
-    ack_text = body["result"]["content"][0]["text"]
-    assert "Streaming" in ack_text or "SSE" in ack_text
-
-    # Background task drains generator synchronously under ASGI test transport.
-    # Dequeue messages from the session store and verify each yielded dict arrived.
-    messages = await store.dequeue_messages(session_id)
-    assert len(messages) == 2
-    assert messages[0] == {"event": "start", "index": 0}
-    assert messages[1] == {"event": "end", "index": 1}
+    # IR-3: POST response contains all yielded dicts as a list
+    content = body["result"]["content"]
+    assert len(content) == 2
+    assert content[0] == {"event": "start", "index": 0}
+    assert content[1] == {"event": "end", "index": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +415,8 @@ async def test_stateful_generator_enqueues_dicts_to_session() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_stateful_generator_exception_enqueues_error_to_session() -> None:
-    """AC-12/AC-85: Stateful generator exception enqueues isError: True message to session."""
+async def test_stateful_generator_exception_returns_is_error_response() -> None:
+    """EC-4: Stateful generator raising mid-iteration returns isError: true in POST response."""
     registry = MCPToolRegistry()
 
     @registry.tool()
@@ -449,10 +444,9 @@ async def test_stateful_generator_exception_enqueues_error_to_session() -> None:
         )
 
     assert resp.status_code == 200
-    messages = await store.dequeue_messages(session_id)
-    # First message: the partial dict
-    assert messages[0] == {"partial": True}
-    # Second message: the error notification
-    error_msg = messages[1]
-    assert error_msg.get("isError") is True
-    assert "stream crashed" in error_msg["content"][0]["text"]
+    body = resp.json()
+    assert "result" in body
+    result = body["result"]
+    # EC-4: generator raised mid-iteration — POST response contains isError: true
+    assert result.get("isError") is True
+    assert "stream crashed" in result["content"][0]["text"]

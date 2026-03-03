@@ -889,8 +889,8 @@ def test_post_endpoint_requires_authentication(client: TestClient):
     data = response.json()
     assert "error" in data
     assert "Authentication required" in data["error"]
-    # WWW-Authenticate is absent when oauth_resource_metadata is not configured (AC-9)
-    assert "WWW-Authenticate" not in response.headers
+    # WWW-Authenticate: Bearer realm="mcp" is always present on 401 (EC-1)
+    assert response.headers["WWW-Authenticate"] == 'Bearer realm="mcp"'
 
 
 @pytest.mark.integration
@@ -1000,8 +1000,8 @@ def test_get_endpoint_requires_authentication(client: TestClient):
     data = response.json()
     assert "error" in data
     assert "Authentication required" in data["error"]
-    # WWW-Authenticate is absent when oauth_resource_metadata is not configured (AC-9)
-    assert "WWW-Authenticate" not in response.headers
+    # WWW-Authenticate: Bearer realm="mcp" is always present on 401 (EC-1)
+    assert response.headers["WWW-Authenticate"] == 'Bearer realm="mcp"'
 
 
 @pytest.mark.integration
