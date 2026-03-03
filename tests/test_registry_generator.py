@@ -74,7 +74,7 @@ def test_register_typing_async_generator_tool_sets_is_generator_true():
     registry = MCPToolRegistry()
 
     @registry.tool()
-    async def gen_tool() -> typing.AsyncGenerator[dict]:
+    async def gen_tool() -> typing.AsyncGenerator[dict, None]:
         """A streaming tool using typing alias."""
         yield {"n": 0}
 
