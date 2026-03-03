@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.0] - 2026-03-02
+
+### Changed
+
+- `AuthValidator` now accepts `Any` return type; falsy values (None, False, 0, empty string/list) trigger HTTP 401 with `WWW-Authenticate: Bearer realm="mcp"`; truthy values stored at `request.state.auth_context` for handler access
+- Resource handlers now support FastAPI `Depends()` parameters with dependency resolution and schema filtering; mirrors tool registry pattern for auth and DB injection in resource providers
+- Stateful POST path collects async generator tool results into JSON array instead of background drainage; enables streaming tools over stateful connections
+- `asyncio.iscoroutinefunction` replaced with `inspect.iscoroutinefunction` in registry.py and resources.py to eliminate Python 3.14 deprecation warnings
+- `create_prm_router()` accepts keyword-only `mcp` parameter (MCPRouter instance) that derives resource URL and authorization_servers automatically; existing `oauth_resource_metadata` dict path preserved for backward compatibility
+- `AuthValidator` type alias added to public `__init__.py` exports
+- Test coverage expanded to 576 tests (32 new) with 90.66% coverage and 0 deprecation warnings
+
 ## [0.1.0] - 2026-03-01
 
 Initial release.
