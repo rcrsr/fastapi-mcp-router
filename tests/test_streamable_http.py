@@ -22,76 +22,13 @@ SSE response reading strategy:
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
 from fastapi_mcp_router import InMemorySessionStore, MCPToolRegistry, create_mcp_router
-
-# ---------------------------------------------------------------------------
-# ASGI capture middleware (replicated from test_sse_streaming.py pattern)
-# ---------------------------------------------------------------------------
-
-
-class SseCapture:
-    """ASGI middleware that captures SSE response headers and body chunks.
-
-    Intercepts http.response.start to record the status code and headers,
-    then signals headers_received so tests can inspect them before the
-    streaming body completes.
-
-    Attributes:
-        app: Inner ASGI application to wrap.
-        status_code: HTTP status code from http.response.start, or None.
-        headers: Response headers dict (lower-case keys), empty until set.
-        chunks: Decoded body chunks received.
-        headers_received: Event that fires when http.response.start arrives.
-    """
-
-    def __init__(self, app: Callable[..., Awaitable[None]]) -> None:
-        self.app = app
-        self.status_code: int | None = None
-        self.headers: dict[str, str] = {}
-        self.chunks: list[str] = []
-        self.headers_received: asyncio.Event = asyncio.Event()
-
-    async def __call__(
-        self,
-        scope: object,
-        receive: object,
-        send: Callable[..., Awaitable[None]],
-    ) -> None:
-        """Wrap the inner app, capturing response start and body messages.
-
-        Args:
-            scope: ASGI connection scope.
-            receive: ASGI receive callable.
-            send: ASGI send callable.
-        """
-
-        async def capturing_send(message: dict[str, object]) -> None:
-            if message["type"] == "http.response.start":
-                status = message["status"]
-                assert isinstance(status, int)
-                self.status_code = status
-                raw_headers = message.get("headers", [])
-                assert isinstance(raw_headers, list)
-                self.headers = {
-                    k.decode(): v.decode()
-                    for k, v in raw_headers  # type: ignore[misc]
-                }
-                self.headers_received.set()
-            elif message["type"] == "http.response.body":
-                body = message.get("body", b"")
-                assert isinstance(body, bytes)
-                if body:
-                    self.chunks.append(body.decode())
-            await send(message)
-
-        await self.app(scope, receive, capturing_send)
-
+from tests.conftest import SseCapture
 
 # ---------------------------------------------------------------------------
 # Helpers

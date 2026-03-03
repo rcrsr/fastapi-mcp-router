@@ -12,7 +12,7 @@ Classes:
 import json
 import types
 from collections.abc import AsyncGenerator, Callable
-from inspect import Parameter, iscoroutinefunction, signature
+from inspect import Parameter, Signature, iscoroutinefunction, signature
 from typing import TypeVar, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, TypeAdapter
@@ -722,80 +722,10 @@ class MCPToolRegistry:
 
         # Execute tool handler with Request, BackgroundTasks, and Depends injection
         try:
-            from fastapi import BackgroundTasks, Request
-
             sig = signature(tool.handler)
-            call_kwargs = dict(arguments)
-
-            # Process parameters for injection
-            for param_name, param in sig.parameters.items():
-                # Check if parameter is typed as Request (handles Union types)
-                if _is_type_or_contains_type(param.annotation, Request, "Request"):
-                    if request is not None:
-                        call_kwargs[param_name] = request
-                    elif param.default is Parameter.empty:
-                        # Required Request parameter but no request provided
-                        raise MCPError(
-                            code=-32603,
-                            message=f"Tool {name} requires Request but none provided",
-                        )
-
-                # Check if parameter is typed as BackgroundTasks (handles Union types)
-                elif _is_type_or_contains_type(param.annotation, BackgroundTasks, "BackgroundTasks"):
-                    if background_tasks is not None:
-                        call_kwargs[param_name] = background_tasks
-                    # BackgroundTasks is typically optional, so no error if None
-
-                # Check if parameter is typed as ProgressCallback
-                elif _is_progress_callback_annotation(param.annotation):
-                    if progress_callback is not None:
-                        call_kwargs[param_name] = progress_callback
-                    else:
-                        # Inject a no-op so the tool can call progress unconditionally
-                        async def _noop_progress(
-                            current: int,
-                            total: int,
-                            message: str | None,
-                        ) -> None:
-                            pass
-
-                        call_kwargs[param_name] = _noop_progress
-
-                # Check if parameter is typed as SamplingManager
-                elif _is_sampling_manager_annotation(param.annotation):
-                    if sampling_manager is not None:
-                        call_kwargs[param_name] = sampling_manager
-                    elif param.default is Parameter.empty:
-                        raise MCPError(
-                            code=-32601,
-                            message="Sampling requires stateful mode with sampling_enabled=True",
-                        )
-                    # else: optional param, pass None implicitly
-
-                # Check if parameter has Depends() default - resolve at runtime
-                # Use class name check since Depends is a special marker
-                elif hasattr(param.default, "__class__") and param.default.__class__.__name__ == "Depends":
-                    dependency_fn = param.default.dependency
-                    if dependency_fn is None:
-                        continue
-
-                    # Call dependency function (may need Request as argument)
-                    dep_sig = signature(dependency_fn)
-                    dep_kwargs: dict[str, object] = {}
-
-                    # Check if dependency needs Request (handles Union types)
-                    for dep_param_name, dep_param in dep_sig.parameters.items():
-                        if _is_type_or_contains_type(dep_param.annotation, Request, "Request"):
-                            if request is not None:
-                                dep_kwargs[dep_param_name] = request
-
-                    # Resolve dependency (sync or async)
-                    if iscoroutinefunction(dependency_fn):
-                        resolved = await dependency_fn(**dep_kwargs)
-                    else:
-                        resolved = dependency_fn(**dep_kwargs)
-
-                    call_kwargs[param_name] = resolved
+            call_kwargs = await self._inject_parameters(
+                name, sig, arguments, request, background_tasks, progress_callback, sampling_manager
+            )
 
             if tool.is_generator:
                 if stateful:
@@ -831,6 +761,117 @@ class MCPToolRegistry:
             raise
         except Exception as e:
             raise MCPError(code=-32603, message=f"Tool execution failed: {e}") from e
+
+    async def _inject_parameters(
+        self,
+        name: str,
+        sig: Signature,
+        arguments: dict[str, object],
+        request: object | None,
+        background_tasks: object | None,
+        progress_callback: object | None,
+        sampling_manager: object | None,
+    ) -> dict[str, object]:
+        """Build call_kwargs by injecting framework objects into tool parameters.
+
+        Iterates the tool handler signature and populates call_kwargs with
+        injected values for Request, BackgroundTasks, ProgressCallback,
+        SamplingManager, and FastAPI Depends parameters. All other parameters
+        pass through from the provided arguments dict unchanged.
+
+        Args:
+            name: Tool name, used in error messages.
+            sig: Inspected signature of the tool handler (from inspect.signature).
+            arguments: Raw arguments dict from the MCP call.
+            request: Optional FastAPI Request to inject into Request-typed params.
+            background_tasks: Optional FastAPI BackgroundTasks to inject.
+            progress_callback: Optional ProgressCallback to inject; a no-op is
+                injected when None so the tool can call it unconditionally.
+            sampling_manager: Optional SamplingManager to inject.
+
+        Returns:
+            Populated call_kwargs dict ready to unpack into the tool handler.
+
+        Raises:
+            MCPError: If a required Request parameter is present but request is None.
+            MCPError: If a required SamplingManager parameter is present but
+                sampling_manager is None.
+        """
+        from fastapi import BackgroundTasks, Request
+
+        call_kwargs = dict(arguments)
+
+        # Process parameters for injection
+        for param_name, param in sig.parameters.items():
+            # Check if parameter is typed as Request (handles Union types)
+            if _is_type_or_contains_type(param.annotation, Request, "Request"):
+                if request is not None:
+                    call_kwargs[param_name] = request
+                elif param.default is Parameter.empty:
+                    # Required Request parameter but no request provided
+                    raise MCPError(
+                        code=-32603,
+                        message=f"Tool {name} requires Request but none provided",
+                    )
+
+            # Check if parameter is typed as BackgroundTasks (handles Union types)
+            elif _is_type_or_contains_type(param.annotation, BackgroundTasks, "BackgroundTasks"):
+                if background_tasks is not None:
+                    call_kwargs[param_name] = background_tasks
+                # BackgroundTasks is typically optional, so no error if None
+
+            # Check if parameter is typed as ProgressCallback
+            elif _is_progress_callback_annotation(param.annotation):
+                if progress_callback is not None:
+                    call_kwargs[param_name] = progress_callback
+                else:
+                    # Inject a no-op so the tool can call progress unconditionally
+                    async def _noop_progress(
+                        current: int,
+                        total: int,
+                        message: str | None,
+                    ) -> None:
+                        pass
+
+                    call_kwargs[param_name] = _noop_progress
+
+            # Check if parameter is typed as SamplingManager
+            elif _is_sampling_manager_annotation(param.annotation):
+                if sampling_manager is not None:
+                    call_kwargs[param_name] = sampling_manager
+                elif param.default is Parameter.empty:
+                    raise MCPError(
+                        code=-32601,
+                        message="Sampling requires stateful mode with sampling_enabled=True",
+                    )
+                # else: optional param, pass None implicitly
+
+            # Check if parameter has Depends() default - resolve at runtime
+            # Use class name check since Depends is a special marker
+            elif hasattr(param.default, "__class__") and param.default.__class__.__name__ == "Depends":
+                dependency_fn = param.default.dependency
+                if dependency_fn is None:
+                    continue
+
+                # Call dependency function (may need Request as argument)
+                dep_sig = signature(dependency_fn)
+                dep_kwargs: dict[str, object] = {}
+
+                # Check if dependency needs Request (handles Union types)
+                for dep_param_name, dep_param in dep_sig.parameters.items():
+                    if _is_type_or_contains_type(dep_param.annotation, Request, "Request"):
+                        if request is not None:
+                            dep_kwargs[dep_param_name] = request
+
+                # Resolve dependency (sync or async)
+                if iscoroutinefunction(dependency_fn):
+                    resolved = await dependency_fn(**dep_kwargs)
+                else:
+                    resolved = dependency_fn(**dep_kwargs)
+
+                call_kwargs[param_name] = resolved
+
+        return call_kwargs
 
     async def _collect_generator(
         self,

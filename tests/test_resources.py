@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI
 
 from fastapi_mcp_router import MCPToolRegistry, ResourceRegistry, create_mcp_router
 from fastapi_mcp_router.exceptions import MCPError
-from fastapi_mcp_router.resources import FileResourceProvider, ResourceProvider
+from fastapi_mcp_router.resources import FileResourceProvider, ResourceContents, ResourceProvider
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -296,19 +296,42 @@ async def test_resources_read_returns_32601_when_no_registry() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC-27: ResourceProvider interface has exactly 5 abstract methods
+# AC-27: ResourceProvider interface has exactly 4 abstract methods; watch is optional
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_resource_provider_has_five_abstract_methods() -> None:
-    """AC-27: ResourceProvider ABC defines exactly 5 abstract methods."""
-    expected_methods = {"list_resources", "read_resource", "subscribe", "unsubscribe", "watch"}
-    for method_name in expected_methods:
+def test_resource_provider_has_four_abstract_methods() -> None:
+    """AC-27: ResourceProvider ABC defines exactly 4 abstract methods; watch is optional."""
+    required_abstract = {"list_resources", "read_resource", "subscribe", "unsubscribe"}
+    for method_name in required_abstract:
         assert hasattr(ResourceProvider, method_name), f"ResourceProvider missing method: {method_name}"
         static_method = inspect.getattr_static(ResourceProvider, method_name)
         is_abstract = getattr(static_method, "__isabstractmethod__", False)
         assert is_abstract, f"ResourceProvider.{method_name} must be abstract"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resource_provider_watch_default_is_empty_async_generator() -> None:
+    """AC-27: ResourceProvider.watch() default implementation yields nothing."""
+
+    class MinimalProvider(ResourceProvider):
+        def list_resources(self) -> list:
+            return []
+
+        async def read_resource(self, uri: str) -> ResourceContents:
+            return ResourceContents(uri=uri, text="")
+
+        def subscribe(self, uri: str) -> bool:
+            return False
+
+        def unsubscribe(self, uri: str) -> bool:
+            return False
+
+    provider = MinimalProvider()
+    results = [r async for r in provider.watch()]
+    assert results == []
 
 
 # ---------------------------------------------------------------------------

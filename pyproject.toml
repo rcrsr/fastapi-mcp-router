@@ -1,6 +1,6 @@
 [project]
 name = "fastapi-mcp-router"
-version = "0.2.0"
+version = "0.2.1"
 description = "Lightweight FastAPI integration for Model Context Protocol (MCP)"
 requires-python = ">=3.11"
 license = "MIT"

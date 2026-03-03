@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-03-03
+
+### Changed
+
+- Reduce cyclomatic complexity in router and registry modules, consolidate duplicated logic, and remove dead code paths across source and test suite
+
 ## [0.2.0] - 2026-03-02
 
 ### Changed

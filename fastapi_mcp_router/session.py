@@ -880,6 +880,27 @@ class MCPLoggingHandler:
         self._session_store = session_store
         self._levels: dict[str, str] = {}
 
+    def _validate_log_level(self, level: str) -> str:
+        """Normalise and validate a log level string.
+
+        Args:
+            level: Log level string to validate (case-insensitive).
+
+        Returns:
+            Normalised (lowercase) log level string.
+
+        Raises:
+            MCPError: -32602 if level is not a recognised log level string (EC-22).
+        """
+        normalised = level.lower() if isinstance(level, str) else str(level).lower()
+        if normalised not in _LOG_LEVEL_PRIORITY:
+            valid = ", ".join(_LOG_LEVEL_PRIORITY)
+            raise MCPError(
+                code=-32602,
+                message=f"Invalid log level: {level!r}. Valid levels: {valid}",
+            )
+        return normalised
+
     def set_level(self, session_id: str, level: str) -> None:
         """Set the minimum log level for a session.
 
@@ -894,13 +915,7 @@ class MCPLoggingHandler:
         Raises:
             MCPError: -32602 if level is not a recognised log level string (EC-22).
         """
-        normalised = level.lower() if isinstance(level, str) else str(level).lower()
-        if normalised not in _LOG_LEVEL_PRIORITY:
-            valid = ", ".join(_LOG_LEVEL_PRIORITY)
-            raise MCPError(
-                code=-32602,
-                message=f"Invalid log level: {level!r}. Valid levels: {valid}",
-            )
+        normalised = self._validate_log_level(level)
         self._levels[session_id] = normalised
 
     async def log_message(
@@ -928,13 +943,7 @@ class MCPLoggingHandler:
         Raises:
             MCPError: -32602 if level is not a recognised log level string (EC-22).
         """
-        normalised = level.lower() if isinstance(level, str) else str(level).lower()
-        if normalised not in _LOG_LEVEL_PRIORITY:
-            valid = ", ".join(_LOG_LEVEL_PRIORITY)
-            raise MCPError(
-                code=-32602,
-                message=f"Invalid log level: {level!r}. Valid levels: {valid}",
-            )
+        normalised = self._validate_log_level(level)
         min_level = self._levels.get(session_id, self._DEFAULT_LEVEL)
         if _LOG_LEVEL_PRIORITY[normalised] < _LOG_LEVEL_PRIORITY[min_level]:
             return

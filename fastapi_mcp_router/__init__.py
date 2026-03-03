@@ -5,7 +5,7 @@ This package provides decorator-based tool registration and stateless HTTP
 transport for MCP protocol version 2025-06-18.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 # Public API exports
 from fastapi_mcp_router.exceptions import MCPError, ToolError

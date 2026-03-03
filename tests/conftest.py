@@ -1,5 +1,5 @@
 """
-Shared test fixtures for fastapi-mcp-router test suite.
+Shared test fixtures and helper classes for fastapi-mcp-router test suite.
 
 Provides five pytest fixtures used across integration test files:
 - registry: empty MCPToolRegistry per test
@@ -7,9 +7,13 @@ Provides five pytest fixtures used across integration test files:
 - client: AsyncClient for the stateless app (no auth)
 - auth_client: AsyncClient for app with X-API-Key auth validator (stateless)
 - session_client: AsyncClient for app with Bearer auth + session callbacks (stateful)
+
+Also provides one shared ASGI helper class:
+- SseCapture: ASGI middleware that captures SSE response headers and body chunks
 """
 
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -166,3 +170,66 @@ async def session_client_fixture(
     transport = httpx.ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+# ---------------------------------------------------------------------------
+# Shared ASGI helper class
+# ---------------------------------------------------------------------------
+
+
+class SseCapture:
+    """ASGI middleware that captures SSE response headers and body chunks.
+
+    Intercepts http.response.start to record the status code and headers,
+    then signals headers_received so tests can inspect them before the
+    streaming body completes.
+
+    Attributes:
+        app: Inner ASGI application to wrap.
+        status_code: HTTP status code from http.response.start, or None.
+        headers: Response headers dict (lower-case keys), empty until set.
+        chunks: Decoded body chunks received.
+        headers_received: Event that fires when http.response.start arrives.
+    """
+
+    def __init__(self, app: Callable[..., Awaitable[None]]) -> None:
+        self.app = app
+        self.status_code: int | None = None
+        self.headers: dict[str, str] = {}
+        self.chunks: list[str] = []
+        self.headers_received: asyncio.Event = asyncio.Event()
+
+    async def __call__(
+        self,
+        scope: object,
+        receive: object,
+        send: Callable[..., Awaitable[None]],
+    ) -> None:
+        """Wrap the inner app, capturing response start and body messages.
+
+        Args:
+            scope: ASGI connection scope.
+            receive: ASGI receive callable.
+            send: ASGI send callable.
+        """
+
+        async def capturing_send(message: dict[str, object]) -> None:
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                assert isinstance(status, int)
+                self.status_code = status
+                raw_headers = message.get("headers", [])
+                assert isinstance(raw_headers, list)
+                self.headers = {
+                    k.decode(): v.decode()
+                    for k, v in raw_headers  # type: ignore[misc]
+                }
+                self.headers_received.set()
+            elif message["type"] == "http.response.body":
+                body = message.get("body", b"")
+                assert isinstance(body, bytes)
+                if body:
+                    self.chunks.append(body.decode())
+            await send(message)
+
+        await self.app(scope, receive, capturing_send)

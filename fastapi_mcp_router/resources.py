@@ -143,8 +143,7 @@ class ResourceProvider(ABC):
         ...     def unsubscribe(self, uri: str) -> bool:
         ...         return False
         ...
-        ...     async def watch(self) -> AsyncIterator[Resource]:
-        ...         raise NotImplementedError
+        ...     # watch() is optional; omit it to inherit the default no-op iterator
     """
 
     @abstractmethod
@@ -191,16 +190,17 @@ class ResourceProvider(ABC):
             True if unsubscription succeeded, False otherwise
         """
 
-    @abstractmethod
     async def watch(self) -> AsyncIterator[Resource]:
         """Async generator yielding resources as they change.
 
-        Returns:
-            AsyncIterator of changed Resource objects
+        Optional override. Returns an empty async iterator by default.
+        Subclasses that support live watching should override this method.
 
-        Raises:
-            NotImplementedError: If this provider does not support watching
+        Returns:
+            AsyncIterator of changed Resource objects; empty by default
         """
+        return
+        yield  # pragma: no cover
 
 
 class _ResourceDefinition:
@@ -415,14 +415,6 @@ class FileResourceProvider(ResourceProvider):
         """
         return False
 
-    async def watch(self) -> AsyncIterator[Resource]:
-        """Raise NotImplementedError; file watching is not supported.
-
-        Raises:
-            NotImplementedError: Always
-        """
-        raise NotImplementedError("FileResourceProvider does not support watch()")
-
 
 def _resolve_file_uri(uri: str, root_path: Path) -> Path:
     """Resolve a file URI to a validated absolute Path within root_path.
@@ -446,10 +438,6 @@ def _resolve_file_uri(uri: str, root_path: Path) -> Path:
         raw = raw[len("file://") :]
 
     # Reject path traversal before any resolution
-    if ".." in raw.split("/"):
-        raise MCPError(code=-32602, message=f"Path traversal not allowed: {uri}")
-
-    # Also check for literal ".." in path components
     path_obj = Path(raw)
     for part in path_obj.parts:
         if part == "..":

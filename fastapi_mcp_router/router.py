@@ -423,8 +423,8 @@ def create_mcp_router(
         try:
             _meter_any_init = cast(Any, _meter)
             _request_counter = _meter_any_init.create_counter("mcp.server.request.count")
-        except Exception:
-            pass
+        except Exception as _meter_exc:
+            logger.debug("OTel meter counter creation failed: %s", _meter_exc)
 
     router = APIRouter()
 
@@ -848,6 +848,624 @@ def create_mcp_router(
         logger.info("Session deleted: %s", session_id_hdr)
         return Response(status_code=204)
 
+    def _parse_and_validate(
+        raw_body: bytes,
+    ) -> tuple[dict, str | None, object, dict] | JSONResponse:
+        """Parse raw bytes into JSON-RPC body and extract fields.
+
+        Returns (body, method, request_id, params) on success.
+        Returns JSONResponse directly on any validation failure.
+        Caller: if isinstance(result, JSONResponse): return result
+
+        Args:
+            raw_body: Raw request body bytes to parse.
+
+        Returns:
+            Tuple (body, method, request_id, params) on success, or
+            JSONResponse on parse/validation failure.
+        """
+        if not raw_body or raw_body.strip() == b"":
+            logger.info("Empty body received - returning server info")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32700,
+                        "message": "Parse error: Empty request body. Send JSON-RPC 2.0 formatted requests.",
+                    },
+                    "id": None,
+                },
+            )
+
+        try:
+            body = json.loads(raw_body)
+        except ValueError as e:
+            logger.error("JSON parse error: %s", e, exc_info=True)
+            return json_rpc_error(
+                request_id=None,
+                code=-32700,
+                message=f"Parse error: {e}",
+            )
+
+        logger.debug("Request body: %s", body)
+        method = body.get("method")
+
+        # Handle JSON-RPC responses from the client (sampling/elicitation correlation).
+        # A response has "result" and "id" but no "method".
+        if "result" in body and "id" in body and method is None:
+            response_id = str(body["id"])
+            response_result: dict = body["result"] if isinstance(body["result"], dict) else {}
+            if _sampling_manager is not None:
+                _sampling_manager.handle_response(response_id, response_result)
+            if _elicitation_manager is not None:
+                _elicitation_manager.handle_response(response_id, response_result)
+            return JSONResponse(status_code=200, content={})
+
+        if body.get("jsonrpc") != "2.0":
+            logger.warning("Invalid JSON-RPC version: %s", body.get("jsonrpc"))
+            return json_rpc_error(
+                request_id=body.get("id"),
+                code=-32600,
+                message="Invalid JSON-RPC version",
+            )
+
+        request_id = body.get("id")
+        params = body.get("params") or {}
+        return (body, method, request_id, params)
+
+    async def _validate_session_header(
+        request: Request,
+        method: str | None,
+        lookup: Callable[[str], Awaitable[object | None]],
+        context: str,
+        missing_description: str,
+    ) -> str | JSONResponse:
+        """Validate Mcp-Session-Id header and resolve session.
+
+        Args:
+            request: FastAPI Request object.
+            method: JSON-RPC method name, or None.
+            lookup: Async callable to look up session data by session ID.
+            context: Context label for log messages (e.g. "session_store").
+            missing_description: Human-readable description when header is missing.
+
+        Returns:
+            Validated session ID string on success, JSONResponse on failure.
+        """
+        sid = request.headers.get("Mcp-Session-Id")
+        if not sid:
+            logger.warning("Missing Mcp-Session-Id header for %s (method: %s)", context, method)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "missing_session_id",
+                    "error_description": missing_description,
+                },
+            )
+        logger.info("Validating session for %s: %s", context, sid)
+        data = await lookup(sid)
+        if data is None:
+            logger.warning("Session not found or expired for %s: %s", context, sid)
+            return JSONResponse(
+                status_code=410,
+                content={
+                    "error": "session_expired",
+                    "error_description": f"Session {sid} not found or expired",
+                    "action": "reconnect",
+                },
+            )
+        logger.info("Session validated for %s: %s", context, sid)
+        return sid
+
+    async def _resolve_session(
+        method: str | None,
+        request: Request,
+        is_oauth_connection: bool,
+        body: dict,
+    ) -> tuple[str | None, str | None] | JSONResponse:
+        """Resolve session state across 3 mutually exclusive paths.
+
+        Returns (active_session_id, session_id_to_return) on success.
+        Returns JSONResponse on auth/session failure.
+
+        Args:
+            method: JSON-RPC method name, or None.
+            request: FastAPI Request object.
+            is_oauth_connection: True when the connection uses Bearer token auth.
+            body: Parsed JSON-RPC request body.
+
+        Returns:
+            Tuple (active_session_id, session_id_to_return) on success, or
+            JSONResponse on auth/session failure.
+        """
+        session_id_to_return: str | None = None
+        active_session_id: str | None = None
+
+        # Log connection mode on initialize (new connection)
+        sessions_enabled = session_getter is not None and session_creator is not None
+        if method == "initialize":
+            auth_method = "oauth" if is_oauth_connection else "api_key"
+            if is_oauth_connection and sessions_enabled:
+                connection_mode = "stateful"
+            else:
+                connection_mode = "stateless" if session_store is None else "stateful-store"
+            logger.info(
+                "New MCP connection: auth=%s mode=%s sessions_enabled=%s",
+                auth_method,
+                connection_mode,
+                sessions_enabled,
+            )
+
+        # Path 1: session_store path — create session on initialize, validate on other methods
+        if session_store is not None:
+            if method == "initialize":
+                protocol_ver_hdr = request.headers.get("MCP-Protocol-Version", "2025-03-26")
+                _init_params = body.get("params", {})
+                client_info = _init_params.get("clientInfo", {})
+                capabilities_req = _init_params.get("capabilities", {})
+                store_new = await session_store.create(
+                    protocol_version=protocol_ver_hdr,
+                    client_info=client_info,
+                    capabilities=capabilities_req,
+                )
+                session_id_to_return = store_new.session_id
+                active_session_id = store_new.session_id
+                logger.info("session_store: new session created via initialize: %s", session_id_to_return)
+            else:
+                result = await _validate_session_header(
+                    request,
+                    method,
+                    session_store.get,
+                    "session_store",
+                    "Mcp-Session-Id header required. Call initialize first.",
+                )
+                if isinstance(result, JSONResponse):
+                    return result
+                active_session_id = result
+            return (active_session_id, session_id_to_return)
+
+        # Path 2: callback-based OAuth path
+        if session_getter is not None and session_creator is not None and is_oauth_connection:
+            if method == "initialize":
+                oauth_client_id = getattr(request.state, "oauth_client_id", None)
+                connection_id = getattr(request.state, "connection_id", None)
+                identifier = oauth_client_id or connection_id
+
+                if identifier is None:
+                    logger.warning(
+                        "Cannot create session: neither oauth_client_id nor connection_id found in request.state"
+                    )
+                    logger.warning(
+                        "Auth validator must set request.state.oauth_client_id (OAuth) "
+                        "or request.state.connection_id (API key)"
+                    )
+                    post_init_401_headers: dict[str, str] = {}
+                    if oauth_resource_metadata is not None:
+                        post_init_base_url = _get_base_url(request)
+                        post_init_rm_url = f"{post_init_base_url}/.well-known/oauth-protected-resource"
+                        post_init_401_headers["WWW-Authenticate"] = f'Bearer resource_metadata="{post_init_rm_url}"'
+                    return JSONResponse(
+                        status_code=401,
+                        headers=post_init_401_headers,
+                        content={
+                            "error": "unauthorized",
+                            "error_description": "Authentication succeeded but no associated identity found",
+                        },
+                    )
+
+                auth_type = "oauth_client" if oauth_client_id else "connection"
+                logger.info(
+                    "Creating new session for %s: %s via initialize",
+                    auth_type,
+                    identifier,
+                )
+                session_id_to_return = await session_creator(oauth_client_id, connection_id)
+
+                session_data: McpSessionData | None = await session_getter(session_id_to_return)
+                if session_data is None:
+                    logger.error(
+                        "Failed to retrieve newly created session: %s",
+                        session_id_to_return,
+                    )
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "internal_error",
+                            "error_description": "Failed to create session",
+                        },
+                    )
+                logger.info("New session created via initialize: %s", session_id_to_return)
+            else:
+                result = await _validate_session_header(
+                    request,
+                    method,
+                    session_getter,
+                    "OAuth connection",
+                    "Mcp-Session-Id header required for OAuth connections. Call initialize first.",
+                )
+                if isinstance(result, JSONResponse):
+                    return result
+                # active_session_id intentionally not set — callback-based sessions do not track it here
+
+            return (active_session_id, session_id_to_return)
+
+        # Path 3: stateless — return (None, None)
+        return (None, None)
+
+    async def _dispatch_method(
+        method: str | None,
+        params: dict,
+        request_id: object,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        is_oauth_connection: bool,
+        active_session_id: str | None,
+        protocol_version: str,
+    ) -> dict | JSONResponse:
+        """Route method to handler, return result dict or early-exit JSONResponse.
+
+        Notifications return JSONResponse(202) directly.
+        Unknown method returns JSONResponse via json_rpc_error(-32601).
+        All other methods return dict.
+
+        Args:
+            method: JSON-RPC method name, or None.
+            params: Parsed params dict from JSON-RPC body.
+            request_id: JSON-RPC request ID.
+            request: FastAPI Request object.
+            background_tasks: FastAPI BackgroundTasks for async operations.
+            is_oauth_connection: True when connection uses Bearer token auth.
+            active_session_id: Current session ID, or None in stateless mode.
+            protocol_version: Negotiated MCP protocol version string.
+
+        Returns:
+            Result dict on success, or JSONResponse for notifications/errors.
+        """
+        if method == "notifications/initialized" and request_id is None:
+            logger.info("Handling notifications/initialized")
+            handle_initialized()
+            return JSONResponse(status_code=202, content={})
+
+        if method == "notifications/cancelled":
+            request_id_to_cancel = params.get("requestId") or params.get("id") if params else None
+            logger.debug(
+                "Received notifications/cancelled for requestId: %s",
+                request_id_to_cancel,
+            )
+            if _progress_tracker is not None and request_id_to_cancel is not None:
+                _progress_tracker.request_cancellation(str(request_id_to_cancel))
+            return JSONResponse(status_code=202, content={})
+
+        if method == "initialize":
+            logger.info(
+                "Handling initialize request with protocol version: %s",
+                protocol_version,
+            )
+            result = handle_initialize(params, protocol_version, server_info)
+            capabilities = dict(result["capabilities"])  # type: ignore[arg-type]
+            if resource_registry is not None and resource_registry.has_resources():
+                capabilities["resources"] = {}
+            if prompt_registry is not None and prompt_registry.has_prompts():
+                capabilities["prompts"] = {}
+            return {**result, "capabilities": capabilities}
+
+        if method == "tools/list":
+            logger.info("Handling tools/list request")
+            excluded = tool_filter(is_oauth_connection) if tool_filter else None
+            return handle_tools_list(registry, excluded_tools=excluded)
+
+        if method == "tools/call":
+            logger.info("Handling tools/call request: %s", params.get("name"))
+            tool_name = params.get("name") if params else None
+
+            # IR-6: create OTel span for tools/call when tracer is available.
+            # EC-4: span creation failure must not break request handling.
+            _tracer_any = cast(Any, _tracer)
+            _span_cm: Any = None
+            _span: Any = None
+            if _tracer_any is not None:
+                try:
+                    _span_cm = _tracer_any.start_as_current_span(f"mcp tools/call {tool_name}")
+                    _span = _span_cm.__enter__()
+                    _span.set_attribute("rpc.system.name", "jsonrpc")
+                    _span.set_attribute("rpc.method", "tools/call")
+                    _span.set_attribute("rpc.jsonrpc.version", "2.0")
+                    _span.set_attribute("mcp.tool.name", tool_name or "")
+                except Exception as _span_exc:
+                    logger.warning("OTel span creation failed for tools/call: %s", _span_exc)
+                    _span_cm = None
+                    _span = None
+
+            # AC-42: create per-request progress callback in stateful mode
+            # AC-43: pass None in stateless mode (registry injects no-op)
+            try:
+                if _progress_tracker is not None and active_session_id is not None:
+                    _meta = params.get("_meta")
+                    progress_token = _meta.get("progressToken") if isinstance(_meta, dict) else None
+                    rpc_request_id = str(progress_token or request_id)
+                    tracker_ref = _progress_tracker
+                    captured_session_id = active_session_id
+                    captured_request_id = rpc_request_id
+
+                    async def _progress_callback(
+                        current: int,
+                        total: int,
+                        message: str | None = None,
+                    ) -> None:
+                        await tracker_ref.report_progress(
+                            captured_session_id,
+                            captured_request_id,
+                            current,
+                            total,
+                            message,
+                        )
+                        if tracker_ref.is_cancelled(captured_request_id):
+                            raise asyncio.CancelledError(f"Request {captured_request_id} cancelled")
+
+                    progress_cb: object | None = _progress_callback
+                else:
+                    progress_cb = None
+
+                return await handle_tools_call(
+                    registry,
+                    params,
+                    request,
+                    background_tasks,
+                    session_store=session_store,
+                    session_id=active_session_id,
+                    progress_callback=progress_cb,
+                    sampling_manager=_sampling_manager,
+                )
+            except Exception as _tools_call_exc:
+                if _span is not None:
+                    with contextlib.suppress(Exception):
+                        _span.set_attribute("error.type", type(_tools_call_exc).__name__)
+                raise
+            finally:
+                if _span_cm is not None:
+                    with contextlib.suppress(Exception):
+                        _exc_info = sys.exc_info()
+                        _span_cm.__exit__(_exc_info[0], _exc_info[1], _exc_info[2])
+
+        if method == "resources/subscribe":
+            logger.info("Handling resources/subscribe request")
+            if session_store is None:
+                raise MCPError(-32601, "resources/subscribe requires stateful mode")
+            sub_uri = params.get("uri") if params else None
+            if not sub_uri:
+                raise MCPError(-32602, "Missing uri parameter")
+            sub_session = await session_store.get(active_session_id or "")
+            if sub_session is None:
+                raise MCPError(-32602, "Session not found")
+            if len(sub_session.subscriptions) >= _SUBSCRIPTIONS_MAX:
+                raise MCPError(-32602, "Subscription limit exceeded (max 100)")
+            sub_session.subscriptions.add(str(sub_uri))
+            await session_store.update(sub_session)
+            return {}
+
+        if method == "resources/unsubscribe":
+            logger.info("Handling resources/unsubscribe request")
+            if session_store is None:
+                raise MCPError(-32601, "resources/unsubscribe requires stateful mode")
+            unsub_uri = params.get("uri") if params else None
+            if not unsub_uri:
+                raise MCPError(-32602, "Missing uri parameter")
+            unsub_session = await session_store.get(active_session_id or "")
+            if unsub_session is None:
+                raise MCPError(-32602, "Session not found")
+            unsub_session.subscriptions.discard(str(unsub_uri))
+            await session_store.update(unsub_session)
+            return {}
+
+        if method == "ping":
+            logger.info("Handling ping request")
+            return {}
+
+        if method == "resources/list":
+            logger.info("Handling resources/list request")
+            if resource_registry is None or not resource_registry.has_resources():
+                raise MCPError(-32601, "Method not found: resources/list")
+            resources = resource_registry.list_resources()
+            templates = resource_registry.list_templates()
+            return {
+                "resources": [
+                    {
+                        "uri": r.uri,
+                        "name": r.name,
+                        "description": r.description,
+                        "mimeType": r.mime_type,
+                    }
+                    for r in resources
+                ],
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": t.uri_template,
+                        "name": t.name,
+                        "description": t.description,
+                        "mimeType": t.mime_type,
+                    }
+                    for t in templates
+                ],
+            }
+
+        if method == "resources/read":
+            logger.info("Handling resources/read request")
+            if resource_registry is None or not resource_registry.has_resources():
+                raise MCPError(-32601, "Method not found: resources/read")
+            uri = params.get("uri", "") if params else ""
+            contents = await resource_registry.read_resource(str(uri), request=request)
+            return {
+                "contents": [
+                    {
+                        "uri": contents.uri,
+                        "mimeType": contents.mime_type,
+                        "text": contents.text,
+                        "blob": contents.blob,
+                    }
+                ]
+            }
+
+        if method == "prompts/list":
+            logger.info("Handling prompts/list request")
+            if prompt_registry is None or not prompt_registry.has_prompts():
+                raise MCPError(-32601, "Method not found: prompts/list")
+            return {"prompts": prompt_registry.list_prompts()}
+
+        if method == "prompts/get":
+            logger.info("Handling prompts/get request")
+            if prompt_registry is None or not prompt_registry.has_prompts():
+                raise MCPError(-32601, "Method not found: prompts/get")
+            prompt_name = params.get("name", "") if params else ""
+            prompt_arguments = params.get("arguments", {}) if params else {}
+            messages = await prompt_registry.get_prompt(
+                str(prompt_name),
+                dict(prompt_arguments) if isinstance(prompt_arguments, dict) else {},
+            )
+            return {"messages": messages}
+
+        if method == "roots/list":
+            logger.info("Handling roots/list request")
+            roots = _roots_manager.list_roots()
+            return {"roots": [{"uri": r["uri"], "name": r.get("name")} for r in roots]}
+
+        if method == "logging/setLevel":
+            logger.info("Handling logging/setLevel request")
+            if _logging_handler is None:
+                raise MCPError(
+                    code=-32601,
+                    message="logging/setLevel requires stateful mode",
+                )
+            level = params.get("level") if params else None
+            if not level or not isinstance(level, str):
+                raise MCPError(
+                    code=-32602,
+                    message="Missing required parameter: level",
+                )
+            _logging_handler.set_level(active_session_id or "", level)
+            return {}
+
+        if method == "completion/complete":
+            logger.info("Handling completion/complete request")
+            if completion_handler is None:
+                raise MCPError(
+                    code=-32601,
+                    message="completion/complete not supported",
+                )
+            ref = params.get("ref", {}) if params else {}
+            argument = params.get("argument", {}) if params else {}
+            completion_result = await completion_handler(ref, argument)
+            completion_dict: dict[str, object] = {}
+            if isinstance(completion_result, dict):
+                for k, v in completion_result.items():
+                    completion_dict[str(k)] = v
+            raw_values = completion_dict.get("values")
+            if isinstance(raw_values, list):
+                completion_dict["values"] = raw_values[:100]
+            return {"completion": completion_dict}
+
+        if method == "elicitation/create":
+            logger.info("Handling elicitation/create request")
+            if session_store is None or _elicitation_manager is None:
+                raise MCPError(
+                    code=-32601,
+                    message="elicitation/create requires stateful mode",
+                )
+            elicit_message = params.get("message", "") if params else ""
+            requested_schema = params.get("requestedSchema", {}) if params else {}
+            return await _elicitation_manager.create(
+                active_session_id or "",
+                str(elicit_message),
+                requested_schema if isinstance(requested_schema, dict) else {},
+            )
+
+        raise MCPError(-32601, f"Method not found: {method}")
+
+    def _format_response(
+        result: dict,
+        request_id: object,
+        request: Request,
+        session_id_to_return: str | None,
+    ) -> JSONResponse | StreamingResponse:
+        """Wrap result dict in JSON-RPC envelope, select transport format.
+
+        SSE when Accept contains text/event-stream AND session_store is not None.
+        Adds Mcp-Session-Id header when session_id_to_return is not None.
+
+        Args:
+            result: Result dict to wrap in JSON-RPC response envelope.
+            request_id: JSON-RPC request ID for the response envelope.
+            request: FastAPI Request object for reading Accept header.
+            session_id_to_return: Session ID to include in response header, or None.
+
+        Returns:
+            StreamingResponse for SSE clients, JSONResponse otherwise.
+        """
+        response = json_rpc_response(request_id, result)
+
+        accept_header = request.headers.get("Accept", "")
+        wants_sse = "text/event-stream" in accept_header
+        if wants_sse and session_store is not None:
+            raw_body = response.body
+            result_body = bytes(raw_body).decode() if isinstance(raw_body, memoryview) else raw_body.decode()
+            sse_headers: dict[str, str] = {"Cache-Control": "no-cache"}
+            if session_id_to_return:
+                sse_headers["Mcp-Session-Id"] = session_id_to_return
+                logger.info(
+                    "Including Mcp-Session-Id header in SSE response: %s",
+                    session_id_to_return,
+                )
+
+            async def _single_event() -> AsyncGenerator[str]:
+                yield f"data: {result_body}\n\n"
+
+            return StreamingResponse(
+                _single_event(),
+                media_type="text/event-stream",
+                headers=sse_headers,
+            )
+
+        if session_id_to_return:
+            response.headers["Mcp-Session-Id"] = session_id_to_return
+            logger.info(
+                "Including Mcp-Session-Id header in response: %s",
+                session_id_to_return,
+            )
+
+        return response
+
+    def _validate_protocol_version(
+        protocol_version: str | None,
+        request_id: object,
+    ) -> tuple[str, JSONResponse | None]:
+        """Normalise and validate the MCP-Protocol-Version header value.
+
+        Defaults a missing header to "2025-03-26" for backward compatibility.
+
+        Args:
+            protocol_version: Raw header value, or None when header is absent.
+            request_id: JSON-RPC request ID used in error response.
+
+        Returns:
+            Tuple of (resolved version string, JSONResponse error or None).
+            The error is a 400 response when the version is unsupported.
+        """
+        logger.debug("MCP-Protocol-Version header: %s", protocol_version)
+        if not protocol_version:
+            logger.info("Missing MCP-Protocol-Version header, assuming 2025-03-26 for backwards compatibility")
+            protocol_version = "2025-03-26"
+        if protocol_version not in ("2025-06-18", "2025-03-26"):
+            logger.warning("Unsupported protocol version: %s", protocol_version)
+            return protocol_version, JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        f"Unsupported protocol version: {protocol_version}. Supported versions: 2025-06-18, 2025-03-26"
+                    )
+                },
+            )
+        return protocol_version, None
+
     @router.post("", dependencies=dependencies, response_model=None)
     async def handle_mcp_request(
         request: Request,
@@ -939,16 +1557,14 @@ def create_mcp_router(
             ...     "params": {"name": "hello", "arguments": {"name": "World"}}
             ... }
         """
-        body = None  # Initialize before try block to avoid UnboundLocalError
+        body = None  # Initialize before try block to avoid UnboundLocalError in except handlers
 
         try:
             logger.info("Received MCP request")
             logger.debug("Request headers: %s", _sanitize_headers(dict(request.headers)))
 
-            # Check authentication using helper function
+            # 1. Auth
             _api_key, _bearer_token, is_valid = await _check_authentication(request, auth_validator)
-
-            # Require authentication: either X-API-Key or Authorization Bearer token
             if not is_valid:
                 logger.warning("Unauthenticated POST request to MCP endpoint")
                 post_401_headers: dict[str, str] = {"WWW-Authenticate": 'Bearer realm="mcp"'}
@@ -967,561 +1583,49 @@ def create_mcp_router(
                     content=post_401_content,
                 )
 
-            # Parse JSON-RPC request early to determine method name
-            # This is needed to exempt "initialize" from session validation
+            # 2. Parse
             raw_body = await request.body()
-            if not raw_body or raw_body.strip() == b"":
-                logger.info("Empty body received - returning server info")
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": -32700,
-                            "message": "Parse error: Empty request body. Send JSON-RPC 2.0 formatted requests.",
-                        },
-                        "id": None,
-                    },
-                )
+            parsed = _parse_and_validate(raw_body)
+            if isinstance(parsed, JSONResponse):
+                return parsed
+            body, method, request_id, params = parsed
 
-            try:
-                body = json.loads(raw_body)
-            except ValueError as e:
-                logger.error("JSON parse error: %s", e, exc_info=True)
-                return json_rpc_error(
-                    request_id=None,
-                    code=-32700,
-                    message=f"Parse error: {e}",
-                )
-
-            logger.debug("Request body: %s", body)
-            method = body.get("method")
-
-            # Handle JSON-RPC responses from the client (sampling/elicitation correlation).
-            # A response has "result" (or "error") and "id" but no "method".
-            # Route to SamplingManager and ElicitationManager to resolve waiting futures.
-            if "result" in body and "id" in body and method is None:
-                response_id = str(body["id"])
-                response_result: dict = body["result"] if isinstance(body["result"], dict) else {}
-                if _sampling_manager is not None:
-                    _sampling_manager.handle_response(response_id, response_result)
-                if _elicitation_manager is not None:
-                    _elicitation_manager.handle_response(response_id, response_result)
-                return JSONResponse(status_code=200, content={})
-
-            # Validate session for OAuth (Bearer token) connections only
-            # API key connections are stateless and don't require session management
-            # "initialize" method creates a new session, so exempt it from validation
-            is_oauth_connection = _bearer_token is not None
-            session_id_to_return: str | None = None
-            sessions_enabled = session_getter is not None and session_creator is not None
-
-            # Track active session ID for session_store streaming tool dispatch
-            active_session_id: str | None = None
-
-            # Log connection mode on initialize (new connection)
-            if method == "initialize":
-                auth_method = "oauth" if is_oauth_connection else "api_key"
-                if is_oauth_connection and sessions_enabled:
-                    connection_mode = "stateful"
-                else:
-                    connection_mode = "stateless" if session_store is None else "stateful-store"
-                logger.info(
-                    "New MCP connection: auth=%s mode=%s sessions_enabled=%s",
-                    auth_method,
-                    connection_mode,
-                    sessions_enabled,
-                )
-
-            # session_store stateful path: create/validate session via store
-            if session_store is not None:
-                if method == "initialize":
-                    # Create a new session in the store using request params
-                    protocol_ver_hdr = request.headers.get("MCP-Protocol-Version", "2025-03-26")
-                    _init_params = body.get("params", {})
-                    client_info = _init_params.get("clientInfo", {})
-                    capabilities_req = _init_params.get("capabilities", {})
-                    store_new = await session_store.create(
-                        protocol_version=protocol_ver_hdr,
-                        client_info=client_info,
-                        capabilities=capabilities_req,
-                    )
-                    session_id_to_return = store_new.session_id
-                    active_session_id = store_new.session_id
-                    logger.info("session_store: new session created via initialize: %s", session_id_to_return)
-                else:
-                    # Non-initialize: require Mcp-Session-Id header
-                    ss_header = request.headers.get("Mcp-Session-Id")
-                    if not ss_header:
-                        logger.warning("Missing Mcp-Session-Id header for session_store (method: %s)", method)
-                        return JSONResponse(
-                            status_code=400,
-                            content={
-                                "error": "missing_session_id",
-                                "error_description": "Mcp-Session-Id header required. Call initialize first.",
-                            },
-                        )
-                    ss_data = await session_store.get(ss_header)
-                    if ss_data is None:
-                        logger.warning("session_store: session not found: %s", ss_header)
-                        return JSONResponse(
-                            status_code=410,
-                            content={
-                                "error": "session_not_found",
-                                "error_description": f"Session {ss_header} not found or expired",
-                                "action": "reconnect",
-                            },
-                        )
-                    active_session_id = ss_header
-                    logger.info("session_store: session validated: %s", ss_header)
-
-            # Use inline check to preserve pyright type narrowing
-            if session_getter is not None and session_creator is not None and is_oauth_connection:
-                if method == "initialize":
-                    # Initialize creates a new session - extract identifier from request.state
-                    # Auth validator sets either oauth_client_id (OAuth) or connection_id (API key)
-                    oauth_client_id = getattr(request.state, "oauth_client_id", None)
-                    connection_id = getattr(request.state, "connection_id", None)
-                    identifier = oauth_client_id or connection_id
-
-                    if identifier is None:
-                        logger.warning(
-                            "Cannot create session: neither oauth_client_id nor connection_id found in request.state"
-                        )
-                        logger.warning(
-                            "Auth validator must set request.state.oauth_client_id (OAuth) "
-                            "or request.state.connection_id (API key)"
-                        )
-                        post_init_401_headers: dict[str, str] = {}
-                        if oauth_resource_metadata is not None:
-                            post_init_base_url = _get_base_url(request)
-                            post_init_rm_url = f"{post_init_base_url}/.well-known/oauth-protected-resource"
-                            post_init_401_headers["WWW-Authenticate"] = f'Bearer resource_metadata="{post_init_rm_url}"'
-                        return JSONResponse(
-                            status_code=401,
-                            headers=post_init_401_headers,
-                            content={
-                                "error": "unauthorized",
-                                "error_description": "Authentication succeeded but no associated identity found",
-                            },
-                        )
-
-                    # Create new session for this identifier
-                    auth_type = "oauth_client" if oauth_client_id else "connection"
-                    logger.info(
-                        "Creating new session for %s: %s via initialize",
-                        auth_type,
-                        identifier,
-                    )
-                    session_id_to_return = await session_creator(oauth_client_id, connection_id)
-
-                    # Validate session was created successfully
-                    session_data: McpSessionData | None = await session_getter(session_id_to_return)
-                    if session_data is None:
-                        logger.error(
-                            "Failed to retrieve newly created session: %s",
-                            session_id_to_return,
-                        )
-                        return JSONResponse(
-                            status_code=500,
-                            content={
-                                "error": "internal_error",
-                                "error_description": "Failed to create session",
-                            },
-                        )
-                    logger.info("New session created via initialize: %s", session_id_to_return)
-
-                else:
-                    # Non-initialize methods require existing session ID
-                    session_id_header = request.headers.get("Mcp-Session-Id")
-
-                    if not session_id_header:
-                        logger.warning(
-                            "Missing Mcp-Session-Id header for OAuth connection (method: %s)",
-                            method,
-                        )
-                        return JSONResponse(
-                            status_code=400,
-                            content={
-                                "error": "missing_session_id",
-                                "error_description": (
-                                    "Mcp-Session-Id header required for OAuth connections. Call initialize first."
-                                ),
-                            },
-                        )
-
-                    # Validate session exists and is not expired
-                    logger.info("Validating session: %s", session_id_header)
-                    session_data: McpSessionData | None = await session_getter(session_id_header)
-
-                    if session_data is None:
-                        logger.warning("Session not found or expired: %s", session_id_header)
-                        return JSONResponse(
-                            status_code=410,  # Gone
-                            content={
-                                "error": "session_expired",
-                                "error_description": f"Session {session_id_header} expired or not found",
-                                "action": "reconnect",
-                            },
-                        )
-
-                    logger.info("Session validated: %s", session_id_header)
-                    # Session activity timestamp updated by session_getter contract
-
-            # Validate protocol version header
-            # Per MCP spec: If missing, assume 2025-03-26 for backwards compatibility
-            protocol_version = request.headers.get("MCP-Protocol-Version")
-            logger.debug("MCP-Protocol-Version header: %s", protocol_version)
-
-            if not protocol_version:
-                logger.info("Missing MCP-Protocol-Version header, assuming 2025-03-26 for backwards compatibility")
-                protocol_version = "2025-03-26"
-
-            # Validate supported versions
-            if protocol_version not in ("2025-06-18", "2025-03-26"):
-                logger.warning("Unsupported protocol version: %s", protocol_version)
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": (
-                            f"Unsupported protocol version: {protocol_version}. "
-                            "Supported versions: 2025-06-18, 2025-03-26"
-                        )
-                    },
-                )
-
-            # Validate JSON-RPC format
-            if body.get("jsonrpc") != "2.0":
-                logger.warning("Invalid JSON-RPC version: %s", body.get("jsonrpc"))
-                return json_rpc_error(
-                    request_id=body.get("id"),
-                    code=-32600,
-                    message="Invalid JSON-RPC version",
-                )
-
-            params = body.get("params", {})
-            request_id = body.get("id")
+            # 3. Protocol version
+            protocol_version, pv_err = _validate_protocol_version(
+                request.headers.get("MCP-Protocol-Version"), request_id
+            )
+            if pv_err is not None:
+                return pv_err
+            # 4. OTel counter
             logger.info("Processing method: %s (id: %s)", method, request_id)
-
-            # Increment OTel request counter per method (IR-7, AC-12)
             if _request_counter is not None:
                 with contextlib.suppress(Exception):  # Meter failure must not break request handling
                     _request_counter.add(1, {"rpc.method": method})
 
-            # Handle notifications (no id field, no response expected)
-            if method == "notifications/initialized" and "id" not in body:
-                logger.info("Handling notifications/initialized")
-                handle_initialized()
-                # Return 202 Accepted with empty body for notifications
-                return JSONResponse(status_code=202, content={})
+            # 5. Session
+            is_oauth_connection = _bearer_token is not None
+            session_result = await _resolve_session(method, request, is_oauth_connection, body)
+            if isinstance(session_result, JSONResponse):
+                return session_result
+            active_session_id, session_id_to_return = session_result
 
-            if method == "notifications/cancelled" and "id" not in body:
-                # Client cancelled an in-flight request (AC-50)
-                request_id_to_cancel = params.get("requestId") or params.get("id") if params else None
-                logger.debug(
-                    "Received notifications/cancelled for requestId: %s",
-                    request_id_to_cancel,
-                )
-                if _progress_tracker is not None and request_id_to_cancel is not None:
-                    _progress_tracker.request_cancellation(str(request_id_to_cancel))
-                return JSONResponse(status_code=202, content={})
+            # 6. Dispatch
+            dispatch_result = await _dispatch_method(
+                method,
+                params,
+                request_id,
+                request,
+                background_tasks,
+                is_oauth_connection,
+                active_session_id,
+                protocol_version,
+            )
+            if isinstance(dispatch_result, JSONResponse):
+                return dispatch_result
 
-            # Handle request methods (with id field, response expected)
-            if method == "initialize":
-                logger.info(
-                    "Handling initialize request with protocol version: %s",
-                    protocol_version,
-                )
-                result = handle_initialize(params, protocol_version, server_info)
-                capabilities = dict(result["capabilities"])  # type: ignore[arg-type]
-                if resource_registry is not None and resource_registry.has_resources():
-                    capabilities["resources"] = {}
-                if prompt_registry is not None and prompt_registry.has_prompts():
-                    capabilities["prompts"] = {}
-                result = {**result, "capabilities": capabilities}
-            elif method == "tools/list":
-                logger.info("Handling tools/list request")
-                excluded = tool_filter(is_oauth_connection) if tool_filter else None
-                result = handle_tools_list(registry, excluded_tools=excluded)
-            elif method == "tools/call":
-                logger.info("Handling tools/call request: %s", params.get("name"))
-                tool_name = params.get("name") if params else None
-
-                # IR-6: create OTel span for tools/call when tracer is available.
-                # EC-4: span creation failure must not break request handling.
-                # Cast to Any: opentelemetry-api is an optional untyped dependency;
-                # attribute access is guarded by the try/except below (EC-4).
-                _tracer_any = cast(Any, _tracer)
-                _span_cm: Any = None
-                _span: Any = None
-                if _tracer_any is not None:
-                    try:
-                        _span_cm = _tracer_any.start_as_current_span(f"mcp tools/call {tool_name}")
-                        _span = _span_cm.__enter__()
-                        _span.set_attribute("rpc.system.name", "jsonrpc")
-                        _span.set_attribute("rpc.method", "tools/call")
-                        _span.set_attribute("rpc.jsonrpc.version", "2.0")
-                        _span.set_attribute("mcp.tool.name", tool_name or "")
-                    except Exception as _span_exc:
-                        logger.warning("OTel span creation failed for tools/call: %s", _span_exc)
-                        _span_cm = None
-                        _span = None
-
-                # AC-42: create per-request progress callback in stateful mode
-                # AC-43: pass None in stateless mode (registry injects no-op)
-                try:
-                    if _progress_tracker is not None and active_session_id is not None:
-                        _meta = params.get("_meta")
-                        progress_token = _meta.get("progressToken") if isinstance(_meta, dict) else None
-                        rpc_request_id = str(progress_token or request_id)
-                        tracker_ref = _progress_tracker
-                        captured_session_id = active_session_id
-                        captured_request_id = rpc_request_id
-
-                        async def _progress_callback(
-                            current: int,
-                            total: int,
-                            message: str | None = None,
-                        ) -> None:
-                            await tracker_ref.report_progress(
-                                captured_session_id,
-                                captured_request_id,
-                                current,
-                                total,
-                                message,
-                            )
-                            if tracker_ref.is_cancelled(captured_request_id):
-                                raise asyncio.CancelledError(f"Request {captured_request_id} cancelled")
-
-                        progress_cb: object | None = _progress_callback
-                    else:
-                        progress_cb = None
-
-                    result = await handle_tools_call(
-                        registry,
-                        params,
-                        request,
-                        background_tasks,
-                        session_store=session_store,
-                        session_id=active_session_id,
-                        progress_callback=progress_cb,
-                        sampling_manager=_sampling_manager,
-                    )
-                except Exception as _tools_call_exc:
-                    if _span is not None:
-                        with contextlib.suppress(Exception):
-                            _span.set_attribute("error.type", type(_tools_call_exc).__name__)
-                    raise
-                finally:
-                    if _span_cm is not None:
-                        with contextlib.suppress(Exception):
-                            _exc_info = sys.exc_info()
-                            _span_cm.__exit__(_exc_info[0], _exc_info[1], _exc_info[2])
-            elif method == "resources/subscribe":
-                logger.info("Handling resources/subscribe request")
-                if session_store is None:
-                    raise MCPError(-32601, "resources/subscribe requires stateful mode")
-                sub_uri = params.get("uri") if params else None
-                if not sub_uri:
-                    raise MCPError(-32602, "Missing uri parameter")
-                sub_session = await session_store.get(active_session_id or "")
-                if sub_session is None:
-                    raise MCPError(-32602, "Session not found")
-                if len(sub_session.subscriptions) >= _SUBSCRIPTIONS_MAX:
-                    raise MCPError(-32602, "Subscription limit exceeded (max 100)")
-                sub_session.subscriptions.add(str(sub_uri))
-                await session_store.update(sub_session)
-                result = {}
-            elif method == "resources/unsubscribe":
-                logger.info("Handling resources/unsubscribe request")
-                if session_store is None:
-                    raise MCPError(-32601, "resources/unsubscribe requires stateful mode")
-                unsub_uri = params.get("uri") if params else None
-                if not unsub_uri:
-                    raise MCPError(-32602, "Missing uri parameter")
-                unsub_session = await session_store.get(active_session_id or "")
-                if unsub_session is None:
-                    raise MCPError(-32602, "Session not found")
-                unsub_session.subscriptions.discard(str(unsub_uri))
-                await session_store.update(unsub_session)
-                result = {}
-            elif method == "ping":
-                logger.info("Handling ping request")
-                result = {}
-            elif method == "resources/list":
-                logger.info("Handling resources/list request")
-                if resource_registry is None or not resource_registry.has_resources():
-                    return json_rpc_error(
-                        request_id=request_id,
-                        code=-32601,
-                        message="Method not found: resources/list",
-                    )
-                resources = resource_registry.list_resources()
-                templates = resource_registry.list_templates()
-                result = {
-                    "resources": [
-                        {
-                            "uri": r.uri,
-                            "name": r.name,
-                            "description": r.description,
-                            "mimeType": r.mime_type,
-                        }
-                        for r in resources
-                    ],
-                    "resourceTemplates": [
-                        {
-                            "uriTemplate": t.uri_template,
-                            "name": t.name,
-                            "description": t.description,
-                            "mimeType": t.mime_type,
-                        }
-                        for t in templates
-                    ],
-                }
-            elif method == "resources/read":
-                logger.info("Handling resources/read request")
-                if resource_registry is None or not resource_registry.has_resources():
-                    return json_rpc_error(
-                        request_id=request_id,
-                        code=-32601,
-                        message="Method not found: resources/read",
-                    )
-                uri = params.get("uri", "") if params else ""
-                contents = await resource_registry.read_resource(str(uri), request=request)
-                result = {
-                    "contents": [
-                        {
-                            "uri": contents.uri,
-                            "mimeType": contents.mime_type,
-                            "text": contents.text,
-                            "blob": contents.blob,
-                        }
-                    ]
-                }
-            elif method == "prompts/list":
-                logger.info("Handling prompts/list request")
-                if prompt_registry is None or not prompt_registry.has_prompts():
-                    return json_rpc_error(
-                        request_id=request_id,
-                        code=-32601,
-                        message="Method not found: prompts/list",
-                    )
-                result = {"prompts": prompt_registry.list_prompts()}
-            elif method == "prompts/get":
-                logger.info("Handling prompts/get request")
-                if prompt_registry is None or not prompt_registry.has_prompts():
-                    return json_rpc_error(
-                        request_id=request_id,
-                        code=-32601,
-                        message="Method not found: prompts/get",
-                    )
-                prompt_name = params.get("name", "") if params else ""
-                prompt_arguments = params.get("arguments", {}) if params else {}
-                messages = await prompt_registry.get_prompt(
-                    str(prompt_name),
-                    dict(prompt_arguments) if isinstance(prompt_arguments, dict) else {},
-                )
-                result = {"messages": messages}
-            elif method == "roots/list":
-                logger.info("Handling roots/list request")
-                roots = _roots_manager.list_roots()
-                result = {"roots": [{"uri": r["uri"], "name": r.get("name")} for r in roots]}
-            elif method == "logging/setLevel":
-                logger.info("Handling logging/setLevel request")
-                if _logging_handler is None:
-                    raise MCPError(
-                        code=-32601,
-                        message="logging/setLevel requires stateful mode",
-                    )
-                level = params.get("level") if params else None
-                if not level or not isinstance(level, str):
-                    raise MCPError(
-                        code=-32602,
-                        message="Missing required parameter: level",
-                    )
-                _logging_handler.set_level(active_session_id or "", level)
-                result = {}
-            elif method == "completion/complete":
-                logger.info("Handling completion/complete request")
-                if completion_handler is None:
-                    raise MCPError(
-                        code=-32601,
-                        message="completion/complete not supported",
-                    )
-                ref = params.get("ref", {}) if params else {}
-                argument = params.get("argument", {}) if params else {}
-                completion_result = await completion_handler(ref, argument)
-                completion_dict: dict[str, object] = {}
-                if isinstance(completion_result, dict):
-                    for k, v in completion_result.items():
-                        completion_dict[str(k)] = v
-                raw_values = completion_dict.get("values")
-                if isinstance(raw_values, list):
-                    completion_dict["values"] = raw_values[:100]
-                result = {"completion": completion_dict}
-            elif method == "elicitation/create":
-                logger.info("Handling elicitation/create request")
-                if session_store is None or _elicitation_manager is None:
-                    raise MCPError(
-                        code=-32601,
-                        message="elicitation/create requires stateful mode",
-                    )
-                message = params.get("message", "") if params else ""
-                requested_schema = params.get("requestedSchema", {}) if params else {}
-                result = await _elicitation_manager.create(
-                    active_session_id or "",
-                    str(message),
-                    requested_schema if isinstance(requested_schema, dict) else {},
-                )
-            else:
-                logger.warning("Method not found: %s", method)
-                return json_rpc_error(
-                    request_id=request_id,
-                    code=-32601,
-                    message=f"Method not found: {method}",
-                )
-
-            # Return successful response
-            # Include Mcp-Session-Id header if session was created during initialize
+            # 7. Format
             logger.info("Returning successful response for method: %s", method)
-            response = json_rpc_response(request_id, result)
-
-            # Parse Accept header to determine response format (IR-3).
-            # If client requests SSE and a session_store is present, return a
-            # StreamingResponse wrapping the result as a single SSE data event.
-            # EC-1: unrecognised Accept values fall through to JSONResponse.
-            # EC-2: SSE requested in stateless mode also falls through.
-            accept_header = request.headers.get("Accept", "")
-            wants_sse = "text/event-stream" in accept_header
-            if wants_sse and session_store is not None:
-                raw_body = response.body
-                result_body = bytes(raw_body).decode() if isinstance(raw_body, memoryview) else raw_body.decode()
-                sse_headers: dict[str, str] = {"Cache-Control": "no-cache"}
-                if session_id_to_return:
-                    sse_headers["Mcp-Session-Id"] = session_id_to_return
-                    logger.info(
-                        "Including Mcp-Session-Id header in SSE response: %s",
-                        session_id_to_return,
-                    )
-
-                async def _single_event() -> AsyncGenerator[str]:
-                    yield f"data: {result_body}\n\n"
-
-                return StreamingResponse(
-                    _single_event(),
-                    media_type="text/event-stream",
-                    headers=sse_headers,
-                )
-
-            # Add session ID header for initialize requests (both callback and store modes)
-            if session_id_to_return:
-                response.headers["Mcp-Session-Id"] = session_id_to_return
-                logger.info(
-                    "Including Mcp-Session-Id header in response: %s",
-                    session_id_to_return,
-                )
-
-            return response
+            return _format_response(dispatch_result, request_id, request, session_id_to_return)
 
         except ValueError as e:
             # ValueError should not occur here since we already parsed the body
