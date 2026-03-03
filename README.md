@@ -1,5 +1,10 @@
 # fastapi-mcp-router
 
+[![CI](https://github.com/rcrsr/fastapi-mcp-router/actions/workflows/ci.yml/badge.svg)](https://github.com/rcrsr/fastapi-mcp-router/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/fastapi-mcp-router)](https://pypi.org/project/fastapi-mcp-router/)
+[![Python versions](https://img.shields.io/pypi/pyversions/fastapi-mcp-router)](https://pypi.org/project/fastapi-mcp-router/)
+[![License](https://img.shields.io/pypi/l/fastapi-mcp-router)](https://github.com/rcrsr/fastapi-mcp-router/blob/main/LICENSE)
+
 Add MCP to your existing FastAPI app. Register tools, resources, and prompts with decorators. Use `Depends()`, `Request`, and `BackgroundTasks` the same way you already do.
 
 ## Why fastapi-mcp-router
