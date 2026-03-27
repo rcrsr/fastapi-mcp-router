@@ -292,6 +292,7 @@ def create_mcp_router(
     completion_handler: Callable[..., Awaitable[object]] | None = None,
     legacy_sse: bool = False,
     enable_telemetry: bool = True,
+    shutdown_event: asyncio.Event | None = None,
 ) -> APIRouter:
     """
     Create FastAPI router for MCP protocol.
@@ -591,7 +592,7 @@ def create_mcp_router(
                     keepalive_ticks = 0  # 1 tick = 1s; keepalive every 30 ticks
 
                     try:
-                        while True:
+                        while shutdown_event is None or not shutdown_event.is_set():
                             # Wait up to 1s for next subscriber event
                             if sub_gen is not None:
                                 try:
@@ -619,6 +620,11 @@ def create_mcp_router(
                             if keepalive_ticks >= 30:
                                 yield ": keepalive\n\n"
                                 keepalive_ticks = 0
+
+                        # Shutdown requested — notify client and close stream.
+                        yield ": server-shutdown\n\n"
+                        if sub_gen is not None:
+                            await sub_gen.aclose()
 
                     except asyncio.CancelledError:
                         logger.info("SSE stream cancelled for session_store session: %s", store_sid)
@@ -791,12 +797,27 @@ def create_mcp_router(
                 try:
                     if gen is None:
                         # AC-6: keepalive-only stream when no subscriber provided.
-                        while True:
-                            await asyncio.sleep(30)
+                        while shutdown_event is None or not shutdown_event.is_set():
+                            if shutdown_event is not None:
+                                # Race sleep against shutdown for prompt exit.
+                                _, pending = await asyncio.wait(
+                                    {
+                                        asyncio.ensure_future(asyncio.sleep(30)),
+                                        asyncio.ensure_future(shutdown_event.wait()),
+                                    },
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                # Cancel any remaining futures.
+                                for task in pending:
+                                    task.cancel()
+                                if shutdown_event.is_set():
+                                    break
+                            else:
+                                await asyncio.sleep(30)
                             yield ": keepalive\n\n"
                     else:
                         # AC-1/AC-4: deliver events; keepalive fires every 30s between events.
-                        while True:
+                        while shutdown_event is None or not shutdown_event.is_set():
                             try:
                                 event_id, payload = await asyncio.wait_for(gen.__anext__(), timeout=30)
                                 yield f"id: {event_id}\nevent: message\ndata: {json.dumps(payload)}\n\n"
@@ -806,6 +827,12 @@ def create_mcp_router(
                             except StopAsyncIteration:
                                 # AC-87: empty or exhausted generator — close stream cleanly.
                                 break
+
+                    # Shutdown requested — notify client and close stream.
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        yield ": server-shutdown\n\n"
+                        if gen is not None:
+                            await gen.aclose()
                 except asyncio.CancelledError:
                     # AC-5: client disconnected — log session ID, do not crash.
                     logger.info("SSE stream cancelled for session: %s", session_label)
@@ -1749,6 +1776,7 @@ class MCPRouter(APIRouter):
         self._tool_registry = MCPToolRegistry()
         self._resource_registry = ResourceRegistry()
         self._prompt_registry = PromptRegistry()
+        self._shutdown_event: asyncio.Event = asyncio.Event()
 
         inner = create_mcp_router(
             registry=self._tool_registry,
@@ -1768,6 +1796,7 @@ class MCPRouter(APIRouter):
             sampling_enabled=sampling_enabled,
             legacy_sse=legacy_sse,
             enable_telemetry=enable_telemetry,
+            shutdown_event=self._shutdown_event,
         )
         # FastAPI blocks include_router when both prefix and route path are
         # empty strings. Since create_mcp_router() registers routes at ""
@@ -1775,6 +1804,21 @@ class MCPRouter(APIRouter):
         # The user-supplied prefix (e.g. prefix="/mcp") is applied later by
         # app.include_router(mcp, prefix="/mcp") as expected.
         self.routes.extend(inner.routes)
+
+    async def shutdown(self) -> None:
+        """Signal active SSE streams to close gracefully.
+
+        Sets the internal shutdown event, causing all SSE generator loops to
+        exit and yield a ``: server-shutdown`` comment before returning.
+
+        Typical usage inside a FastAPI lifespan handler::
+
+            @asynccontextmanager
+            async def lifespan(app: FastAPI):
+                yield
+                await mcp.shutdown()
+        """
+        self._shutdown_event.set()
 
     def tool(
         self,
