@@ -7,12 +7,12 @@ telemetry is explicitly disabled via enable=False.
 try:
     from opentelemetry import trace as _otel_trace  # type: ignore[import-untyped]
 except ImportError:
-    _otel_trace = None
+    _otel_trace = None  # ty:ignore[invalid-assignment]
 
 try:
     from opentelemetry import metrics as _otel_metrics  # type: ignore[import-untyped]
 except ImportError:
-    _otel_metrics = None
+    _otel_metrics = None  # ty:ignore[invalid-assignment]
 
 
 def _get_otel_provider(enable: bool, module: object, factory: str) -> object:

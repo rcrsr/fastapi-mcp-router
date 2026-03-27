@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-26
+
+### Added
+
+- `MCPRouter.shutdown()` method signals active SSE streams to close gracefully
+- `shutdown_event` parameter on `create_mcp_router()` for direct factory usage
+- SSE generators yield `: server-shutdown` comment before closing on shutdown
+- Graceful shutdown test suite (4 tests covering both SSE code paths)
+
 ## [0.2.1] - 2026-03-03
 
 ### Changed

@@ -292,6 +292,7 @@ def create_mcp_router(
     completion_handler: Callable[..., Awaitable[object]] | None = None,
     legacy_sse: bool = False,
     enable_telemetry: bool = True,
+    shutdown_event: asyncio.Event | None = None,
 ) -> APIRouter:
     """
     Create FastAPI router for MCP protocol.
@@ -354,6 +355,12 @@ def create_mcp_router(
         completion_handler: Optional async callable for completion/complete requests.
             Takes (ref, argument) and returns a dict with a "values" key (list).
             If None, completion/complete returns -32601 Method not found.
+        shutdown_event: Optional asyncio.Event that signals SSE generators to
+            exit gracefully. When set, both legacy SSE generators
+            (store_event_stream and event_stream) break their loops and yield
+            a ``: server-shutdown`` comment before returning. If None
+            (default), generators run until client disconnect. MCPRouter
+            creates and manages this automatically via its shutdown() method.
 
     Returns:
         Configured APIRouter with POST endpoint at route "". When included
@@ -591,7 +598,7 @@ def create_mcp_router(
                     keepalive_ticks = 0  # 1 tick = 1s; keepalive every 30 ticks
 
                     try:
-                        while True:
+                        while shutdown_event is None or not shutdown_event.is_set():
                             # Wait up to 1s for next subscriber event
                             if sub_gen is not None:
                                 try:
@@ -619,6 +626,11 @@ def create_mcp_router(
                             if keepalive_ticks >= 30:
                                 yield ": keepalive\n\n"
                                 keepalive_ticks = 0
+
+                        # Shutdown requested — notify client and close stream.
+                        yield ": server-shutdown\n\n"
+                        if sub_gen is not None:
+                            await sub_gen.aclose()
 
                     except asyncio.CancelledError:
                         logger.info("SSE stream cancelled for session_store session: %s", store_sid)
@@ -791,21 +803,41 @@ def create_mcp_router(
                 try:
                     if gen is None:
                         # AC-6: keepalive-only stream when no subscriber provided.
-                        while True:
-                            await asyncio.sleep(30)
+                        while shutdown_event is None or not shutdown_event.is_set():
+                            if shutdown_event is not None:
+                                try:
+                                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                                    # Shutdown event fired.
+                                    break
+                                except TimeoutError:
+                                    pass
+                            else:
+                                await asyncio.sleep(30)
                             yield ": keepalive\n\n"
                     else:
                         # AC-1/AC-4: deliver events; keepalive fires every 30s between events.
-                        while True:
+                        # Poll every 1s so shutdown_event is checked promptly.
+                        keepalive_ticks = 0
+                        while shutdown_event is None or not shutdown_event.is_set():
                             try:
-                                event_id, payload = await asyncio.wait_for(gen.__anext__(), timeout=30)
+                                event_id, payload = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
                                 yield f"id: {event_id}\nevent: message\ndata: {json.dumps(payload)}\n\n"
+                                keepalive_ticks = 0
                             except TimeoutError:
+                                keepalive_ticks += 1
                                 # AC-4: 30s elapsed without an event — send keepalive.
-                                yield ": keepalive\n\n"
+                                if keepalive_ticks >= 30:
+                                    yield ": keepalive\n\n"
+                                    keepalive_ticks = 0
                             except StopAsyncIteration:
                                 # AC-87: empty or exhausted generator — close stream cleanly.
                                 break
+
+                    # Shutdown requested — notify client and close stream.
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        yield ": server-shutdown\n\n"
+                        if gen is not None:
+                            await gen.aclose()
                 except asyncio.CancelledError:
                     # AC-5: client disconnected — log session ID, do not crash.
                     logger.info("SSE stream cancelled for session: %s", session_label)
@@ -1143,7 +1175,7 @@ def create_mcp_router(
                 protocol_version,
             )
             result = handle_initialize(params, protocol_version, server_info)
-            capabilities = dict(result["capabilities"])  # type: ignore[arg-type]
+            capabilities = dict(cast(dict[str, object], result["capabilities"]))
             if resource_registry is not None and resource_registry.has_resources():
                 capabilities["resources"] = {}
             if prompt_registry is not None and prompt_registry.has_prompts():
@@ -1749,6 +1781,7 @@ class MCPRouter(APIRouter):
         self._tool_registry = MCPToolRegistry()
         self._resource_registry = ResourceRegistry()
         self._prompt_registry = PromptRegistry()
+        self._shutdown_event: asyncio.Event = asyncio.Event()
 
         inner = create_mcp_router(
             registry=self._tool_registry,
@@ -1768,6 +1801,7 @@ class MCPRouter(APIRouter):
             sampling_enabled=sampling_enabled,
             legacy_sse=legacy_sse,
             enable_telemetry=enable_telemetry,
+            shutdown_event=self._shutdown_event,
         )
         # FastAPI blocks include_router when both prefix and route path are
         # empty strings. Since create_mcp_router() registers routes at ""
@@ -1775,6 +1809,21 @@ class MCPRouter(APIRouter):
         # The user-supplied prefix (e.g. prefix="/mcp") is applied later by
         # app.include_router(mcp, prefix="/mcp") as expected.
         self.routes.extend(inner.routes)
+
+    async def shutdown(self) -> None:
+        """Signal active SSE streams to close gracefully.
+
+        Sets the internal shutdown event, causing all SSE generator loops to
+        exit and yield a ``: server-shutdown`` comment before returning.
+
+        Typical usage inside a FastAPI lifespan handler::
+
+            @asynccontextmanager
+            async def lifespan(app: FastAPI):
+                yield
+                await mcp.shutdown()
+        """
+        self._shutdown_event.set()
 
     def tool(
         self,
@@ -2218,7 +2267,7 @@ async def handle_tools_call(
         raise MCPError(code=-32602, message="Invalid arguments: must be an object")
 
     # Type narrowing for ty - after isinstance check, arguments is dict[str, object]
-    tool_arguments: dict[str, object] = arguments  # type: ignore[assignment]
+    tool_arguments = cast(dict[str, object], arguments)
 
     # Stateful generator mode: registry returns raw AsyncGenerator for synchronous collection
     use_stateful_streaming = session_store is not None and session_id is not None
@@ -2237,7 +2286,7 @@ async def handle_tools_call(
 
         # IR-3: stateful generator — collect all yielded items into a list for the POST response
         if use_stateful_streaming and hasattr(result, "__aiter__"):
-            gen_result: AsyncGenerator[dict] = result  # type: ignore[assignment]
+            gen_result = cast(AsyncGenerator[dict], result)
             try:
                 collected = await registry._collect_generator(gen_result)
             except ToolError as gen_err:
