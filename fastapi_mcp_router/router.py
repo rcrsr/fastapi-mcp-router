@@ -355,6 +355,12 @@ def create_mcp_router(
         completion_handler: Optional async callable for completion/complete requests.
             Takes (ref, argument) and returns a dict with a "values" key (list).
             If None, completion/complete returns -32601 Method not found.
+        shutdown_event: Optional asyncio.Event that signals SSE generators to
+            exit gracefully. When set, both legacy SSE generators
+            (store_event_stream and event_stream) break their loops and yield
+            a ``: server-shutdown`` comment before returning. If None
+            (default), generators run until client disconnect. MCPRouter
+            creates and manages this automatically via its shutdown() method.
 
     Returns:
         Configured APIRouter with POST endpoint at route "". When included
@@ -799,19 +805,12 @@ def create_mcp_router(
                         # AC-6: keepalive-only stream when no subscriber provided.
                         while shutdown_event is None or not shutdown_event.is_set():
                             if shutdown_event is not None:
-                                # Race sleep against shutdown for prompt exit.
-                                _, pending = await asyncio.wait(
-                                    {
-                                        asyncio.ensure_future(asyncio.sleep(30)),
-                                        asyncio.ensure_future(shutdown_event.wait()),
-                                    },
-                                    return_when=asyncio.FIRST_COMPLETED,
-                                )
-                                # Cancel any remaining futures.
-                                for task in pending:
-                                    task.cancel()
-                                if shutdown_event.is_set():
+                                try:
+                                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                                    # Shutdown event fired.
                                     break
+                                except TimeoutError:
+                                    pass
                             else:
                                 await asyncio.sleep(30)
                             yield ": keepalive\n\n"
