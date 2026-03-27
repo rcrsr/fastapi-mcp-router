@@ -817,13 +817,19 @@ def create_mcp_router(
                             yield ": keepalive\n\n"
                     else:
                         # AC-1/AC-4: deliver events; keepalive fires every 30s between events.
+                        # Poll every 1s so shutdown_event is checked promptly.
+                        keepalive_ticks = 0
                         while shutdown_event is None or not shutdown_event.is_set():
                             try:
-                                event_id, payload = await asyncio.wait_for(gen.__anext__(), timeout=30)
+                                event_id, payload = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
                                 yield f"id: {event_id}\nevent: message\ndata: {json.dumps(payload)}\n\n"
+                                keepalive_ticks = 0
                             except TimeoutError:
+                                keepalive_ticks += 1
                                 # AC-4: 30s elapsed without an event — send keepalive.
-                                yield ": keepalive\n\n"
+                                if keepalive_ticks >= 30:
+                                    yield ": keepalive\n\n"
+                                    keepalive_ticks = 0
                             except StopAsyncIteration:
                                 # AC-87: empty or exhausted generator — close stream cleanly.
                                 break

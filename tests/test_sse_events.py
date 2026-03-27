@@ -362,10 +362,10 @@ async def test_sse_last_event_id_passed_to_subscriber() -> None:
 async def test_sse_keepalive_at_30s_interval() -> None:
     """Keepalive comment appears in stream when asyncio.wait_for timeout fires.
 
-    The router uses asyncio.wait_for(gen.__anext__(), timeout=30) to wait for
-    the next event. When the timeout fires (TimeoutError), it yields a keepalive.
-    This test patches asyncio.wait_for in the router module so the 30-second
-    timeout raises TimeoutError immediately, triggering the keepalive branch.
+    The router uses asyncio.wait_for(gen.__anext__(), timeout=1.0) to poll for
+    events. After 30 consecutive timeouts, it yields a keepalive. This test
+    patches asyncio.wait_for in the router module so the 1-second timeout
+    raises TimeoutError immediately, accumulating 30 ticks quickly.
     """
 
     async def event_subscriber(
@@ -391,14 +391,14 @@ async def test_sse_keepalive_at_30s_interval() -> None:
     real_wait_for = asyncio.wait_for
 
     async def instant_timeout(coro: Any, timeout: float, **kwargs: Any) -> Any:
-        """Raise TimeoutError immediately for 30-second waits; delegate otherwise.
+        """Raise TimeoutError immediately for subscriber poll waits; delegate otherwise.
 
         Args:
             coro: Coroutine or future to wrap.
             timeout: Timeout in seconds.
             **kwargs: Additional keyword arguments passed to real wait_for.
         """
-        if timeout >= 10:
+        if timeout >= 0.5:
             # Cancel the wrapped coroutine to avoid resource leaks before raising.
             task = asyncio.ensure_future(coro)
             task.cancel()
