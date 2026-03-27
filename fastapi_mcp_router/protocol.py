@@ -118,7 +118,7 @@ def json_rpc_error(
         >>> #   }
         >>> # }
     """
-    error = {
+    error: dict[str, int | str | dict[str, object]] = {
         "code": code,
         "message": message,
     }

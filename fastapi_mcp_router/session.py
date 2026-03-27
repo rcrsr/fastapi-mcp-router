@@ -38,7 +38,7 @@ from fastapi_mcp_router.exceptions import MCPError
 try:
     import redis.asyncio as _aioredis_runtime  # type: ignore[import-untyped]
 except ImportError:
-    _aioredis_runtime = None
+    _aioredis_runtime = None  # ty:ignore[invalid-assignment]
 
 
 class _AsyncRedisPipeline(Protocol):
@@ -356,7 +356,7 @@ class RedisSessionStore(SessionStore):
         """
         if _aioredis_runtime is None:
             raise RuntimeError("redis-py is required for RedisSessionStore. Install it with: pip install redis")
-        self._redis: _AsyncRedisClient = redis_client  # type: ignore[assignment]
+        self._redis: _AsyncRedisClient = redis_client  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
         self.ttl_seconds = ttl_seconds
 
     def _session_key(self, session_id: str) -> str:
@@ -534,7 +534,7 @@ class RedisSessionStore(SessionStore):
             pipe.lrange(queue_key, 0, -1)
             pipe.delete(queue_key)
             results = await pipe.execute()
-            raw_messages: list[str | bytes] = results[0]  # type: ignore[assignment]
+            raw_messages: list[str | bytes] = results[0]  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
             if not raw_messages:
                 return []
             raw_messages.reverse()

@@ -1176,7 +1176,7 @@ def create_mcp_router(
                 protocol_version,
             )
             result = handle_initialize(params, protocol_version, server_info)
-            capabilities = dict(result["capabilities"])  # type: ignore[arg-type]
+            capabilities = dict(cast(dict[str, object], result["capabilities"]))
             if resource_registry is not None and resource_registry.has_resources():
                 capabilities["resources"] = {}
             if prompt_registry is not None and prompt_registry.has_prompts():
@@ -2268,7 +2268,7 @@ async def handle_tools_call(
         raise MCPError(code=-32602, message="Invalid arguments: must be an object")
 
     # Type narrowing for ty - after isinstance check, arguments is dict[str, object]
-    tool_arguments: dict[str, object] = arguments  # type: ignore[assignment]
+    tool_arguments = cast(dict[str, object], arguments)
 
     # Stateful generator mode: registry returns raw AsyncGenerator for synchronous collection
     use_stateful_streaming = session_store is not None and session_id is not None
@@ -2287,7 +2287,7 @@ async def handle_tools_call(
 
         # IR-3: stateful generator — collect all yielded items into a list for the POST response
         if use_stateful_streaming and hasattr(result, "__aiter__"):
-            gen_result: AsyncGenerator[dict] = result  # type: ignore[assignment]
+            gen_result = cast(AsyncGenerator[dict], result)
             try:
                 collected = await registry._collect_generator(gen_result)
             except ToolError as gen_err:
