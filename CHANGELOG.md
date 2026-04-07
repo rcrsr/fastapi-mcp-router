@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-07
+
 ### Fixed
 
 - SSE stream no longer terminates on transient Redis failures; `dequeue_messages()` errors are caught and retried on the next polling tick
