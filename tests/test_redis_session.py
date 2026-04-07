@@ -441,6 +441,30 @@ async def test_delete_redis_failure_raises_mcp_error():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_dequeue_messages_retries_on_transient_failure():
+    """dequeue_messages() retries once on transient error and returns messages on success."""
+    store, redis_mock = _make_store()
+    pipe = redis_mock.pipeline.return_value
+    pipe.execute = AsyncMock(
+        side_effect=[
+            ConnectionError("transient"),
+            [
+                [json.dumps({"method": "ping"}).encode()],
+                1,
+            ],
+        ]
+    )
+
+    with patch("fastapi_mcp_router.session.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        result = await store.dequeue_messages("sess-1")
+
+    assert result == [{"method": "ping"}]
+    assert pipe.execute.call_count == 2
+    mock_sleep.assert_awaited_once_with(0.5)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_enqueue_message_redis_failure_raises_mcp_error():
     """enqueue_message() raises MCPError -32603 when llen raises (AC-84/EC-27)."""
     store, redis_mock = _make_store()
@@ -455,12 +479,17 @@ async def test_enqueue_message_redis_failure_raises_mcp_error():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_dequeue_messages_redis_failure_raises_mcp_error():
-    """dequeue_messages() raises MCPError -32603 when pipeline.execute raises (AC-84/EC-27)."""
+    """dequeue_messages() raises MCPError -32603 after retry exhaustion (AC-84/EC-27)."""
     store, redis_mock = _make_store()
     pipe = redis_mock.pipeline.return_value
     pipe.execute = AsyncMock(side_effect=ConnectionError("Redis unavailable"))
 
-    with pytest.raises(MCPError) as exc_info:
+    with (
+        patch("fastapi_mcp_router.session.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        pytest.raises(MCPError) as exc_info,
+    ):
         await store.dequeue_messages("sess-1")
 
     assert exc_info.value.code == -32603
+    assert pipe.execute.call_count == 2
+    mock_sleep.assert_awaited_once_with(0.5)
