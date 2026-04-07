@@ -542,11 +542,13 @@ class RedisSessionStore(SessionStore):
                 return [json.loads(m if isinstance(m, str) else m.decode()) for m in raw_messages]
             except MCPError:
                 raise
-            except Exception as e:
+            except (ConnectionError, TimeoutError, OSError) as e:
                 if attempt == 0:
                     logger.warning("dequeue_messages transient failure for %s, retrying: %s", session_id, e)
                     await asyncio.sleep(0.5)
                     continue
+                raise MCPError(code=-32603, message=f"Redis error dequeuing messages: {e}") from e
+            except Exception as e:
                 raise MCPError(code=-32603, message=f"Redis error dequeuing messages: {e}") from e
         return []  # unreachable but satisfies type checker
 

@@ -18,6 +18,7 @@ task that drives the infinite streaming generator.
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,8 @@ import pytest_asyncio
 from fastapi import FastAPI, Request
 
 from fastapi_mcp_router import MCPToolRegistry, create_mcp_router
+from fastapi_mcp_router.exceptions import MCPError
+from fastapi_mcp_router.session import InMemorySessionStore
 from fastapi_mcp_router.types import McpSessionData
 from tests.conftest import SseCapture
 
@@ -608,3 +611,139 @@ async def test_sse_keepalive_yield_fires_with_patched_sleep(session_client: Stat
     assert len(capture.chunks) > 0, "No chunks received from SSE stream"
     full_content = "".join(capture.chunks)
     assert "keepalive" in full_content, f"Expected keepalive in stream, got: {full_content!r}"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for session_store-based resilience tests
+# ---------------------------------------------------------------------------
+
+
+def _build_store_app() -> tuple[FastAPI, InMemorySessionStore]:
+    """Build a FastAPI app using InMemorySessionStore for the session_store code path.
+
+    Returns:
+        Tuple of (FastAPI app, InMemorySessionStore instance).
+    """
+    registry = MCPToolRegistry()
+    store = InMemorySessionStore()
+
+    @registry.tool()
+    async def dummy() -> dict:
+        """Dummy tool for test setup."""
+        return {}
+
+    async def auth_validator(api_key: str | None, bearer_token: str | None) -> bool:
+        return bearer_token is not None
+
+    router = create_mcp_router(
+        registry,
+        session_store=store,
+        auth_validator=auth_validator,
+        legacy_sse=True,
+    )
+    app = FastAPI()
+    app.include_router(router, prefix="/mcp")
+    return app, store
+
+
+async def _init_store_session(client: httpx.AsyncClient) -> str:
+    """Send initialize POST and return session ID for a session_store app.
+
+    Args:
+        client: AsyncClient for the store-based app.
+
+    Returns:
+        Session ID from Mcp-Session-Id header.
+    """
+    resp = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "clientInfo": {}, "capabilities": {}},
+        },
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert resp.status_code == 200, f"initialize failed: {resp.text}"
+    return resp.headers["Mcp-Session-Id"]
+
+
+# ---------------------------------------------------------------------------
+# Resilience: transient MCPError from dequeue_messages does not kill SSE stream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_sse_stream_survives_transient_dequeue_failure() -> None:
+    """SSE stream continues after a transient MCPError from dequeue_messages."""
+    app, _store = _build_store_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        session_id = await _init_store_session(client)
+
+    original_dequeue = InMemorySessionStore.dequeue_messages
+    call_count = 0
+
+    async def failing_then_ok(self: InMemorySessionStore, sid: str) -> list[dict]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise MCPError(code=-32603, message="transient")
+        return await original_dequeue(self, sid)
+
+    with patch.object(InMemorySessionStore, "dequeue_messages", failing_then_ok):
+        capture = await _run_sse_capture(
+            app,
+            headers={
+                "Authorization": "Bearer test-token",
+                "Mcp-Session-Id": session_id,
+            },
+            settle_seconds=1.5,
+        )
+
+    assert capture.status_code == 200
+    body = "".join(capture.chunks)
+    assert "SSE stream established" in body
+    assert "event: error" not in body
+
+
+# ---------------------------------------------------------------------------
+# Resilience: non-MCPError from dequeue_messages yields event: error payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_sse_stream_yields_error_event_on_fatal_failure() -> None:
+    """SSE stream yields event: error with JSON-RPC payload on non-MCPError exception."""
+    app, _store = _build_store_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        session_id = await _init_store_session(client)
+
+    async def fatal_dequeue(self: InMemorySessionStore, sid: str) -> list[dict]:
+        raise RuntimeError("unexpected failure")
+
+    with patch.object(InMemorySessionStore, "dequeue_messages", fatal_dequeue):
+        capture = await _run_sse_capture(
+            app,
+            headers={
+                "Authorization": "Bearer test-token",
+                "Mcp-Session-Id": session_id,
+            },
+            settle_seconds=1.5,
+        )
+
+    assert capture.status_code == 200
+    body = "".join(capture.chunks)
+    assert "event: error" in body
+    for line in body.split("\n"):
+        if line.startswith("data: ") and "-32603" in line:
+            payload = json.loads(line[len("data: ") :])
+            assert payload["jsonrpc"] == "2.0"
+            assert payload["error"]["code"] == -32603
+            break
+    else:
+        pytest.fail("No JSON-RPC error data line found in SSE stream")
