@@ -441,6 +441,44 @@ async def test_delete_redis_failure_raises_mcp_error():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_dequeue_messages_retries_on_transient_failure():
+    """dequeue_messages() retries once on transient error and returns messages on success."""
+    store, redis_mock = _make_store()
+    pipe = redis_mock.pipeline.return_value
+    pipe.execute = AsyncMock(
+        side_effect=[
+            ConnectionError("transient"),
+            [
+                [json.dumps({"method": "ping"}).encode()],
+                1,
+            ],
+        ]
+    )
+
+    with patch("fastapi_mcp_router.session.asyncio.sleep", new_callable=AsyncMock):
+        result = await store.dequeue_messages("sess-1")
+
+    assert result == [{"method": "ping"}]
+    assert pipe.execute.call_count == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_dequeue_messages_raises_after_retry_exhausted():
+    """dequeue_messages() raises MCPError -32603 after both attempts fail."""
+    store, redis_mock = _make_store()
+    pipe = redis_mock.pipeline.return_value
+    pipe.execute = AsyncMock(side_effect=ConnectionError("Redis unavailable"))
+
+    with patch("fastapi_mcp_router.session.asyncio.sleep", new_callable=AsyncMock), pytest.raises(MCPError) as exc_info:
+        await store.dequeue_messages("sess-1")
+
+    assert exc_info.value.code == -32603
+    assert pipe.execute.call_count == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_enqueue_message_redis_failure_raises_mcp_error():
     """enqueue_message() raises MCPError -32603 when llen raises (AC-84/EC-27)."""
     store, redis_mock = _make_store()

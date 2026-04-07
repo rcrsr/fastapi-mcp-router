@@ -529,20 +529,26 @@ class RedisSessionStore(SessionStore):
             MCPError: -32603 if the Redis operation fails.
         """
         queue_key = self._queue_key(session_id)
-        try:
-            pipe = self._redis.pipeline()
-            pipe.lrange(queue_key, 0, -1)
-            pipe.delete(queue_key)
-            results = await pipe.execute()
-            raw_messages: list[str | bytes] = results[0]  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
-            if not raw_messages:
-                return []
-            raw_messages.reverse()
-            return [json.loads(m if isinstance(m, str) else m.decode()) for m in raw_messages]
-        except MCPError:
-            raise
-        except Exception as e:
-            raise MCPError(code=-32603, message=f"Redis error dequeuing messages: {e}") from e
+        for attempt in range(2):
+            try:
+                pipe = self._redis.pipeline()
+                pipe.lrange(queue_key, 0, -1)
+                pipe.delete(queue_key)
+                results = await pipe.execute()
+                raw_messages: list[str | bytes] = results[0]  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
+                if not raw_messages:
+                    return []
+                raw_messages.reverse()
+                return [json.loads(m if isinstance(m, str) else m.decode()) for m in raw_messages]
+            except MCPError:
+                raise
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning("dequeue_messages transient failure for %s, retrying: %s", session_id, e)
+                    await asyncio.sleep(0.5)
+                    continue
+                raise MCPError(code=-32603, message=f"Redis error dequeuing messages: {e}") from e
+        return []  # unreachable but satisfies type checker
 
 
 class ProgressTracker:

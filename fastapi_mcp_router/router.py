@@ -615,7 +615,11 @@ def create_mcp_router(
                                 keepalive_ticks += 1
 
                             # IC-8: poll dequeue_messages every 1s
-                            messages = await session_store.dequeue_messages(store_sid)
+                            try:
+                                messages = await session_store.dequeue_messages(store_sid)
+                            except Exception:
+                                logger.warning("dequeue_messages failed for session %s, retrying next tick", store_sid)
+                                messages = []
                             for msg in messages:
                                 event_counter += 1
                                 yield f"id: {event_counter}\nevent: message\ndata: {json.dumps(msg)}\n\n"
@@ -637,6 +641,10 @@ def create_mcp_router(
                         if sub_gen is not None:
                             await sub_gen.aclose()
                         raise
+                    except Exception:
+                        logger.exception("SSE stream fatal error for session %s", store_sid)
+                        error_payload = json.dumps({"code": -32603, "message": "Internal stream error"})
+                        yield f"event: error\ndata: {error_payload}\n\n"
 
                 return StreamingResponse(
                     store_event_stream(),

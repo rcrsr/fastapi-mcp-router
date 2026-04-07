@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- SSE stream no longer terminates on transient Redis failures; `dequeue_messages()` errors are caught and retried on the next polling tick
+- SSE stream yields `event: error` with JSON-RPC error payload before closing on unrecoverable failures, replacing silent connection drops
+- `RedisSessionStore.dequeue_messages()` retries once with 0.5s backoff before raising `MCPError(-32603)`, reducing empty-poll windows on Upstash idle disconnects
+
 ## [0.3.0] - 2026-03-26
 
 ### Added
