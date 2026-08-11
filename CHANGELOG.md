@@ -7,14 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP 2025-11-25 support:** Protocol revision `2025-11-25` is supported additively alongside `2025-06-18` and `2025-03-26`; clients negotiating an older revision see payloads unchanged from 0.3.1. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Version-negotiation clamping:** An unrecognized `protocolVersion` is now clamped down to the newest supported revision instead of rejected. An unclampable version returns JSON-RPC `-32602` with `data.supported` and `data.requested` at HTTP 200, replacing the former HTTP 400 plain-error body. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Cursor-based pagination:** `tools/list`, `resources/list`, `prompts/list`, and `resources/templates/list` accept an opaque `cursor` and return `nextCursor`, defaulting to 100 items per page. `encode_cursor` and `paginate` are exported for custom list handlers. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **`resources/templates/list` method:** URI templates are now served from their own paginated method, in addition to the existing inline `resourceTemplates` bundle on `resources/list`. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Expanded `initialize` capabilities:** The capability block now advertises `tools.listChanged`, `resources.listChanged`, `resources.subscribe`, `prompts.listChanged`, and `logging` when a session store is configured and the corresponding registry is non-empty. Stateless servers keep the bare `0.3.1` capability shape. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **List-changed notifications:** `notify_tools_list_changed()`, `notify_resources_list_changed()`, `notify_prompts_list_changed()`, and `notify_resource_updated()` on `MCPRouter` fan out over SSE to subscribed sessions. `SessionStore` gains `list_sessions()` and `find_subscribers()` to support this. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Typed content blocks:** `ImageContent`, `AudioContent`, and `ResourceLinkContent` join `TextContent` as exported tool-response types, emitted only to clients on `2025-11-25` or newer. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Tool `title` and `ToolAnnotations`:** `@registry.tool()` accepts a human-readable `title` and typed annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **`Icon` on all four carriers:** The `@tool`, `@resource`, and `@prompt` decorators accept `icons=[{"src": ..., "mimeType": ...}]`, and resource templates carry them too. Icons are validated at registration time against an HTTPS/`data:` scheme allowlist and an image MIME allowlist, and SVG sources are scanned for executable content across raw, percent-encoded, and base64 representations. This is a best-effort blocklist, not a sanitizer — apply CSP `script-src 'none'` or DOMPurify when rendering icons in a browser. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+
 ### Changed
 
-- **BREAKING:** `SessionStore` ABC adds two new required abstract methods, `list_sessions()` and `find_subscribers()`; downstream custom `SessionStore` implementations must implement both to remain instantiable
+- **BREAKING:** `SessionStore` ABC adds two new required abstract methods, `list_sessions()` and `find_subscribers()`; downstream custom `SessionStore` implementations must implement both to remain instantiable. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
 - **BREAKING:** Server-hosted `roots/list` handling is removed. The `roots_manager` parameter and its `RootsManager()` default are gone from `create_mcp_router()`, and `RootsManager` (`session.py`) and `Root` (`types.py`) no longer exist. A `roots/list` request now falls through to the generic unknown-method path and returns a JSON-RPC `-32601` error. Neither symbol was previously exported in `__all__`, so this affects only callers that passed `roots_manager=` directly.
 
   This removes functionality that was never spec-conformant: the MCP specification defines `roots/list` as a request the *server* sends to the *client* to discover the client's workspace roots — a client capability, not an inbound method a server handles. This library's server-hosted implementation inverted that direction. Roots itself is deprecated as of the `2026-07-28` MCP specification revision, with implementations encouraged to migrate toward passing directories or files via tool parameters, resource URIs, or server configuration instead. No server-side replacement is offered here — that is intentional, since a conformant client-hosted roots capability is outside this server library's scope.
 
-  This ships as a `0.4.0` minor release rather than a major version because the project is still in SemVer's `0.x` initial-development phase, where the public API is explicitly unstable and a disclosed breaking change may ship in a minor release.
+  This ships as a `0.4.0` minor release rather than a major version because the project is still in SemVer's `0.x` initial-development phase, where the public API is explicitly unstable and a disclosed breaking change may ship in a minor release. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
 
 ## [0.3.1] - 2026-04-07
 
