@@ -2,7 +2,8 @@
 FastAPI MCP Router - Lightweight FastAPI integration for Model Context Protocol.
 
 This package provides decorator-based tool registration and stateless HTTP
-transport for MCP protocol version 2025-06-18.
+transport, negotiating MCP protocol versions 2025-11-25, 2025-06-18, and
+2025-03-26.
 """
 
 __version__ = "0.4.0"

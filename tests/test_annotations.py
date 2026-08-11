@@ -196,6 +196,8 @@ def test_tool_annotations_model_dump_used_as_annotations_argument():
     Exercises the intended usage path for the typed ToolAnnotations model: build one,
     dump it to a dict, and confirm the resulting tools/list wire shape matches what raw
     dict-based annotations already produce (see test_tool_with_annotations_includes_annotations_field).
+    registry.tool() also validates the dict against ToolAnnotations at registration
+    time (see test_tool_annotations_invalid_hint_type_rejected for the negative path).
     """
     from fastapi_mcp_router import ToolAnnotations
 
@@ -223,3 +225,23 @@ def test_tool_annotations_model_dump_used_as_annotations_argument():
     tools = response.json()["result"]["tools"]
     tool = next(t for t in tools if t["name"] == "typed_annotations_tool")
     assert tool["annotations"] == {"readOnlyHint": True, "title": "Typed Tool"}
+
+
+@pytest.mark.unit
+def test_tool_annotations_invalid_hint_type_rejected():
+    """A known ToolAnnotations field with the wrong type is rejected at registration.
+
+    registry.tool() validates annotations via ToolAnnotations.model_validate(),
+    so a known hint field (readOnlyHint) that isn't a bool raises a pydantic
+    ValidationError instead of silently reaching the wire.
+    """
+    from pydantic import ValidationError
+
+    registry = MCPToolRegistry()
+
+    with pytest.raises(ValidationError):
+
+        @registry.tool(annotations={"readOnlyHint": {"nested": "object"}})
+        async def invalid_annotations_tool(value: str) -> str:
+            """Tool with an invalid annotation value."""
+            return value

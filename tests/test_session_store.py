@@ -138,6 +138,50 @@ async def test_session_stores_negotiated_not_raw_protocol_version() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_stateful_session_does_not_downgrade_on_missing_header() -> None:
+    """A session negotiated at 2025-11-25 keeps emitting icons even when a later
+    request omits the MCP-Protocol-Version header (which would otherwise default
+    to 2025-03-26 and gate icons off)."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(icons=[{"src": "https://example.com/icon.png"}])
+    async def icon_tool() -> str:
+        """Tool with icon."""
+        return "ok"
+
+    store = InMemorySessionStore()
+    router = create_mcp_router(registry, session_store=store)
+    app = FastAPI()
+    app.include_router(router, prefix="/mcp")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        init_resp = await client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "clientInfo": {}, "capabilities": {}},
+            },
+            headers={"MCP-Protocol-Version": "2025-11-25", "X-API-Key": "test-key"},
+        )
+        session_id = init_resp.headers.get("Mcp-Session-Id")
+        assert session_id is not None
+
+        # Subsequent request omits MCP-Protocol-Version entirely.
+        list_resp = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            headers={"X-API-Key": "test-key", "Mcp-Session-Id": session_id},
+        )
+
+    tools = list_resp.json()["result"]["tools"]
+    assert tools[0]["icons"] == [{"src": "https://example.com/icon.png"}]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_delete_unknown_session_returns_404() -> None:
     """AC-19: DELETE /mcp with a non-existent session ID returns 404."""
     registry = MCPToolRegistry()

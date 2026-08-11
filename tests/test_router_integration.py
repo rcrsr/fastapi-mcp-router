@@ -18,6 +18,7 @@ from fastapi_mcp_router import (
     MCPError,
     MCPToolRegistry,
     ToolError,
+    __version__,
     create_mcp_router,
 )
 from fastapi_mcp_router.router import _SUPPORTED_PROTOCOL_VERSIONS, _negotiate_protocol_version
@@ -197,7 +198,7 @@ def test_initialize_server_info(client: TestClient):
     assert "name" in result["serverInfo"]
     assert "version" in result["serverInfo"]
     assert result["serverInfo"]["name"] == "fastapi-mcp-router"
-    assert result["serverInfo"]["version"] == "0.1.0"
+    assert result["serverInfo"]["version"] == __version__
 
 
 @pytest.mark.integration
@@ -242,7 +243,7 @@ def test_initialize_partial_server_info_merges_defaults(registry: MCPToolRegistr
     result = response.json()["result"]
     # Defaults preserved
     assert result["serverInfo"]["name"] == "fastapi-mcp-router"
-    assert result["serverInfo"]["version"] == "0.1.0"
+    assert result["serverInfo"]["version"] == __version__
     # Custom field added
     assert result["serverInfo"]["title"] == "Just a Title"
 

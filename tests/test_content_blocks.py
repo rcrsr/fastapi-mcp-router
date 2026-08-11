@@ -1,11 +1,11 @@
 """
 Unit and integration tests for the content-block builder in fastapi_mcp_router.router.
 
-Unit tests cover build_content_block: wire shapes for text/image/audio/resource_link,
-version gating below 2025-11-25, and invalid data-scheme rejection. Also
+Unit tests cover build_content_block: wire shapes for text/image/audio/resource_link
+(emitted regardless of negotiated protocol version, since none of these types
+are 2025-11-25-only additions), and invalid data-scheme rejection. Also
 cover handle_tools_call routing content-block tool results through the
-builder with the negotiated version, including mixed-content ordering and
-uniform omission of gated block types for pre-2025-11-25 clients.
+builder with the negotiated version, including mixed-content ordering.
 
 Integration tests cover the same behavior through a real HTTP round trip
 (httpx.AsyncClient against a mounted FastAPI app), per the unit/integration
@@ -29,7 +29,6 @@ from fastapi_mcp_router.types import (
     ResourceLinkContent,
     TextContent,
 )
-
 
 
 @pytest.mark.unit
@@ -132,12 +131,13 @@ def test_build_content_block_resource_link_full_shape_with_all_optional_fields_s
     ],
 )
 @pytest.mark.parametrize("negotiated_version", ["2025-06-18", "2025-03-26"])
-def test_build_content_block_gated_types_omitted_below_2025_11_25(block, negotiated_version):
+def test_build_content_block_not_gated_below_2025_11_25(block, negotiated_version):
     # Act
     result = build_content_block(block, negotiated_version)
 
     # Assert
-    assert result is None
+    assert result is not None
+    assert result["type"] == block.type
 
 
 @pytest.mark.unit
@@ -252,7 +252,7 @@ async def test_handle_tools_call_all_content_block_types_present_and_in_order():
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("negotiated_version", ["2025-06-18", "2025-03-26"])
-async def test_handle_tools_call_omits_gated_block_when_negotiated_version_predates_gate(
+async def test_handle_tools_call_emits_image_block_below_2025_11_25(
     negotiated_version,
 ):
     # Arrange
@@ -272,14 +272,17 @@ async def test_handle_tools_call_omits_gated_block_when_negotiated_version_preda
     )
 
     # Assert
-    assert result["content"] == [{"type": "text", "text": "caption"}]
+    assert result["content"] == [
+        {"type": "text", "text": "caption"},
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+    ]
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("negotiated_version", ["2025-06-18", "2025-03-26"])
-async def test_handle_tools_call_gated_blocks_uniformly_omitted_no_error_raised(negotiated_version):
-    """All three gated block types (image, audio, resource_link) are omitted together, no partial emission."""
+async def test_handle_tools_call_emits_all_content_types_below_2025_11_25(negotiated_version):
+    """Image, audio, and resource_link blocks are all emitted for pre-2025-11-25 clients, no omission."""
     # Arrange
     registry = MCPToolRegistry()
 
@@ -302,7 +305,12 @@ async def test_handle_tools_call_gated_blocks_uniformly_omitted_no_error_raised(
     )
 
     # Assert
-    assert result["content"] == [{"type": "text", "text": "caption"}]
+    assert result["content"] == [
+        {"type": "text", "text": "caption"},
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+        {"type": "audio", "data": "ZmFrZQ==", "mimeType": "audio/wav"},
+        {"type": "resource_link", "uri": "file:///tmp/report.csv", "name": "report.csv"},
+    ]
     assert "isError" not in result or result["isError"] is False
 
 
@@ -486,8 +494,8 @@ async def test_tools_call_resource_link_content_with_icon_over_http_flat_shape()
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protocol_version", ["2025-06-18", "2025-03-26"])
-async def test_tools_call_gated_content_blocks_omitted_over_http_no_error(protocol_version: str):
-    """Integration: image/audio/resource_link blocks are omitted with no error for older clients."""
+async def test_tools_call_all_content_blocks_emitted_over_http_for_older_clients(protocol_version: str):
+    """Integration: image/audio/resource_link blocks are emitted (not omitted) for older clients."""
     # Arrange
     registry = MCPToolRegistry()
 
@@ -516,5 +524,10 @@ async def test_tools_call_gated_content_blocks_omitted_over_http_no_error(protoc
     # Assert
     body = response.json()
     assert "error" not in body
-    assert body["result"]["content"] == [{"type": "text", "text": "caption"}]
+    assert body["result"]["content"] == [
+        {"type": "text", "text": "caption"},
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+        {"type": "audio", "data": "ZmFrZQ==", "mimeType": "audio/wav"},
+        {"type": "resource_link", "uri": "file:///tmp/report.csv", "name": "report.csv"},
+    ]
     assert body["result"].get("isError", False) is False

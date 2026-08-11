@@ -304,6 +304,38 @@ class Icon(BaseModel):
         return v
 
 
+_ICONS_MIN_PROTOCOL_VERSION = "2025-11-25"
+
+
+def icons_supported(protocol_version: str | None) -> bool:
+    """
+    Return whether the negotiated protocol version supports icon fields.
+
+    Icons were added to the MCP wire protocol in the "2025-11-25" spec
+    revision. Callers that shape tools, prompts, resources, or resource
+    templates for the wire use this to decide whether to include an
+    ``icons`` field, so the version threshold is defined once instead of
+    being duplicated at each shaping call site.
+
+    Args:
+        protocol_version: Negotiated MCP protocol version string (e.g.
+            "2025-11-25"), or None when no version has been negotiated.
+
+    Returns:
+        True if protocol_version is not None and is lexicographically
+        greater than or equal to "2025-11-25".
+
+    Example:
+        >>> icons_supported("2025-11-25")
+        True
+        >>> icons_supported("2025-06-18")
+        False
+        >>> icons_supported(None)
+        False
+    """
+    return protocol_version is not None and protocol_version >= _ICONS_MIN_PROTOCOL_VERSION
+
+
 class ImageContent(BaseModel):
     """
     Image content in MCP response.

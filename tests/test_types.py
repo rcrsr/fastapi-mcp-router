@@ -14,7 +14,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from fastapi_mcp_router import ServerIcon, ServerInfo, TextContent, ToolResponse
+from fastapi_mcp_router import MCPToolRegistry, ServerIcon, ServerInfo, TextContent, ToolResponse, create_mcp_router
 from fastapi_mcp_router.exceptions import MCPError
 from fastapi_mcp_router.router import handle_initialize
 from fastapi_mcp_router.types import (
@@ -681,6 +681,18 @@ def test_handle_initialize_rejects_server_icon_with_unsafe_svg_data_uri() -> Non
     }
     with pytest.raises(MCPError, match="Invalid server_info icon"):
         handle_initialize({}, "2025-06-18", server_info)
+
+
+@pytest.mark.unit
+def test_create_mcp_router_rejects_invalid_server_info_icon_at_construction() -> None:
+    """create_mcp_router validates server_info icons once, fails fast with ValueError."""
+    registry = MCPToolRegistry()
+    server_info: ServerInfo = {
+        "name": "my-server",
+        "icons": [{"src": "http://example.com/icon.png"}],
+    }
+    with pytest.raises(ValueError, match="Invalid server_info icon"):
+        create_mcp_router(registry, server_info=server_info)
 
 
 @pytest.mark.unit

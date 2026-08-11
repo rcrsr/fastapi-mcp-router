@@ -629,6 +629,40 @@ async def test_find_subscribers_skips_key_that_expires_between_scan_and_mget():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_find_subscribers_batches_mget_when_key_count_exceeds_chunk_size():
+    """find_subscribers(uri) issues one MGET per chunk instead of a single
+    MGET spanning the entire keyspace, bounding peak memory during a scan
+    over more sessions than fit in one chunk."""
+    from fastapi_mcp_router.session import _SCAN_MGET_CHUNK_SIZE
+
+    store, redis_mock = _make_store()
+    subscribed = _make_session("sess-sub")
+    subscribed.subscriptions.add("file:///a.txt")
+    other = _make_session("sess-other")
+
+    key_count = _SCAN_MGET_CHUNK_SIZE + 1
+    keys = [f"mcp:session:sess-{i}" for i in range(key_count - 1)] + ["mcp:session:sess-sub"]
+    redis_mock.scan_iter = _make_scan_iter(keys)
+
+    async def fake_mget(batch_keys: list[str]) -> list[str | None]:
+        return [
+            _serialize_session(store, subscribed) if k == "mcp:session:sess-sub" else _serialize_session(store, other)
+            for k in batch_keys
+        ]
+
+    redis_mock.mget = AsyncMock(side_effect=fake_mget)
+
+    ids = await store.find_subscribers("file:///a.txt")
+
+    assert ids == ["sess-sub"]
+    assert redis_mock.mget.call_count == 2
+    first_call_keys, second_call_keys = (call.args[0] for call in redis_mock.mget.call_args_list)
+    assert len(first_call_keys) == _SCAN_MGET_CHUNK_SIZE
+    assert len(second_call_keys) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_find_subscribers_redis_failure_raises_mcp_error():
     """find_subscribers(uri) raises MCPError -32603 when MGET fails."""
     store, redis_mock = _make_store()

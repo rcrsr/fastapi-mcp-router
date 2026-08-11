@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_MAX = 1000
 _SUBSCRIPTIONS_MAX = 100
+_SCAN_MGET_CHUNK_SIZE = 500
 
 
 @dataclass
@@ -609,13 +610,40 @@ class RedisSessionStore(SessionStore):
                 raise MCPError(code=-32603, message=f"Redis error dequeuing messages: {e}") from e
         return []  # unreachable but satisfies type checker
 
+    async def _scan_key_chunks(self, prefix: str) -> AsyncIterator[list[str]]:
+        """Yield session keys matching prefix in fixed-size chunks.
+
+        Batches the non-blocking SCAN cursor into chunks of at most
+        ``_SCAN_MGET_CHUNK_SIZE`` keys so callers can process (and, for
+        ``find_subscribers``, MGET) the keyspace incrementally instead of
+        buffering every matched key/value in memory at once. Peak memory is
+        bounded by chunk size rather than by the number of live sessions.
+
+        Args:
+            prefix: Key prefix to match, e.g. ``self._session_key("")``.
+
+        Yields:
+            Lists of decoded key strings, each with at most
+            ``_SCAN_MGET_CHUNK_SIZE`` entries.
+        """
+        chunk: list[str] = []
+        async for key in self._redis.scan_iter(match=f"{prefix}*"):  # type: ignore[attr-defined]
+            chunk.append(key if isinstance(key, str) else key.decode())
+            if len(chunk) >= _SCAN_MGET_CHUNK_SIZE:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
     async def list_sessions(self) -> list[str]:
         """Return the ids of all live session keys in Redis.
 
         Enumerates keys via non-blocking SCAN (not KEYS) over the
-        ``mcp:session:*`` namespace. Only unexpired keys exist in Redis
-        (TTL-based expiration removes them automatically), so every
-        matched key represents a live session.
+        ``mcp:session:*`` namespace, processed in fixed-size chunks so peak
+        memory during enumeration is bounded rather than growing with the
+        SCAN cursor. Only unexpired keys exist in Redis (TTL-based
+        expiration removes them automatically), so every matched key
+        represents a live session.
 
         Returns:
             List of session_id strings for sessions currently present in Redis.
@@ -625,10 +653,9 @@ class RedisSessionStore(SessionStore):
         """
         prefix = self._session_key("")
         try:
-            session_ids = []
-            async for key in self._redis.scan_iter(match=f"{prefix}*"):  # type: ignore[attr-defined]
-                key_str = key if isinstance(key, str) else key.decode()
-                session_ids.append(key_str[len(prefix) :])
+            session_ids: list[str] = []
+            async for chunk in self._scan_key_chunks(prefix):
+                session_ids.extend(key[len(prefix) :] for key in chunk)
             return session_ids
         except Exception as e:
             raise MCPError(code=-32603, message=f"Redis error listing sessions: {e}") from e
@@ -636,10 +663,12 @@ class RedisSessionStore(SessionStore):
     async def find_subscribers(self, uri: str) -> list[str]:
         """Return the ids of live sessions subscribed to the given resource URI.
 
-        Scans all session keys via SCAN, then reads all matched values in a
-        single batched ``MGET`` round-trip (rather than one ``GET`` per key)
-        before filtering by subscription. A key that expires between the
-        SCAN and the MGET yields ``None`` for that slot and is skipped.
+        Scans session keys in fixed-size chunks, issuing one batched
+        ``MGET`` per chunk (rather than one ``GET`` per key, or a single
+        ``MGET`` across the entire keyspace) and filtering by subscription
+        incrementally. Peak memory is bounded by chunk size rather than by
+        the number of live sessions. A key that expires between its SCAN and
+        MGET yields ``None`` for that slot and is skipped.
 
         Args:
             uri: Resource URI to search subscriptions for.
@@ -652,20 +681,15 @@ class RedisSessionStore(SessionStore):
         """
         prefix = self._session_key("")
         try:
-            keys = [
-                key if isinstance(key, str) else key.decode()
-                async for key in self._redis.scan_iter(match=f"{prefix}*")  # type: ignore[attr-defined]
-            ]
-            if not keys:
-                return []
-            raw_values = await self._redis.mget(keys)
-            subscriber_ids = []
-            for raw in raw_values:
-                if raw is None:
-                    continue
-                session = self._deserialize(raw if isinstance(raw, str) else raw.decode())
-                if uri in session.subscriptions:
-                    subscriber_ids.append(session.session_id)
+            subscriber_ids: list[str] = []
+            async for chunk in self._scan_key_chunks(prefix):
+                raw_values = await self._redis.mget(chunk)
+                for raw in raw_values:
+                    if raw is None:
+                        continue
+                    session = self._deserialize(raw if isinstance(raw, str) else raw.decode())
+                    if uri in session.subscriptions:
+                        subscriber_ids.append(session.session_id)
             return subscriber_ids
         except Exception as e:
             raise MCPError(code=-32603, message=f"Redis error finding subscribers: {e}") from e

@@ -87,6 +87,7 @@ MCPRouter.resource(
     name: str | None = None,
     description: str | None = None,
     mime_type: str | None = None,
+    icons: list[dict] | None = None,
 ) -> Callable
 ```
 
@@ -98,6 +99,7 @@ Decorator. Registers an async function as an MCP resource handler. URI supports 
 | `name` | Function name | Resource display name |
 | `description` | Docstring | Resource description |
 | `mime_type` | `None` | MIME type for the content |
+| `icons` | `None` | List of icon descriptor dicts, forwarded to `ResourceRegistry.resource()` (see [ResourceRegistry](#resourceregistry) below) |
 
 **Raises:** `TypeError` if the function is not async.
 
@@ -108,6 +110,7 @@ MCPRouter.prompt(
     name: str | None = None,
     description: str | None = None,
     arguments: list[dict] | None = None,
+    icons: list[dict] | None = None,
 ) -> Callable
 ```
 
@@ -118,6 +121,7 @@ Decorator. Registers a sync or async function as an MCP prompt. Arguments are au
 | `name` | Function name | Prompt identifier |
 | `description` | Docstring | Prompt description |
 | `arguments` | `None` | Reserved for future use |
+| `icons` | `None` | List of icon descriptor dicts, forwarded to `PromptRegistry.prompt()` (see [PromptRegistry](#promptregistry) below) |
 
 #### add_resource_provider()
 
@@ -296,7 +300,7 @@ When this is the final page, `nextCursor` is omitted from the result. A malforme
 
 ### Protocol version negotiation
 
-Negotiation is driven **exclusively** by the `MCP-Protocol-Version` HTTP header (`_validate_protocol_version`, `fastapi_mcp_router/router.py:1791-1820`). The router accepts a header declaring any value — it does not reject unknown or future versions outright. Instead it **clamps** the requested version to the highest version in its supported whitelist that is `<=` the requested version, using ISO-date lexicographic comparison (`_negotiate_protocol_version`, `router.py:166-198`, whitelist at `router.py:77`).
+Negotiation is driven **exclusively** by the `MCP-Protocol-Version` HTTP header (`_validate_protocol_version`). The router accepts a header declaring any value — it does not reject unknown or future versions outright. Instead it **clamps** the requested version to the highest version in its supported whitelist that is `<=` the requested version, using ISO-date lexicographic comparison (`_negotiate_protocol_version`, whitelist in `_SUPPORTED_PROTOCOL_VERSIONS`).
 
 The `protocolVersion` field inside the `initialize` request params is accepted but never read — `handle_initialize` does not validate, clamp, or reflect it in the response. The response's `protocolVersion` is always the header-negotiated value from `_validate_protocol_version`, which may differ from whatever the client placed in `params.protocolVersion`.
 
@@ -304,7 +308,7 @@ Supported whitelist (highest to lowest): `2025-11-25`, `2025-06-18`, `2025-03-26
 
 | `MCP-Protocol-Version` header | Negotiated version | Why |
 |---|---|---|
-| *(absent/missing)* | `2025-03-26` | Missing header defaults to `2025-03-26` before negotiation (`router.py:1810-1812`) |
+| *(absent/missing)* | `2025-03-26` | Missing header defaults to `2025-03-26` before negotiation (`_validate_protocol_version`) |
 | `2025-11-25` | `2025-11-25` | Exact match — highest supported version `<=` requested |
 | `2026-07-28` (future/unknown) | `2025-11-25` | No exact match; clamps down to the highest supported version `<=` requested |
 | `2025-06-18` | `2025-06-18` | Exact match |
@@ -454,6 +458,22 @@ Returns tool definitions in MCP format. Each dict contains:
 }
 ```
 
+#### shape_tool()
+
+```python
+MCPToolRegistry.shape_tool(tool: ToolDefinition, protocol_version: str | None = None) -> dict
+```
+
+Formats a single raw tool definition for the MCP wire protocol. Extracted from `list_tools()` so callers that paginate (e.g. `tools/list` in `router.py`) can shape only the page of tools being returned instead of the entire registry.
+
+#### get_raw_tools()
+
+```python
+MCPToolRegistry.get_raw_tools() -> list[ToolDefinition]
+```
+
+Returns raw, unshaped tool definitions in registration order. Enables callers to paginate the raw registry before shaping items to the wire format.
+
 #### call_tool()
 
 ```python
@@ -514,10 +534,19 @@ ResourceRegistry.resource(
     name: str | None = None,
     description: str | None = None,
     mime_type: str | None = None,
+    icons: list[dict] | None = None,
 ) -> Callable
 ```
 
 Decorator. Registers an async function as a resource handler. The `uri_template` supports `{param}` placeholders per RFC 6570.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `uri_template` | (required) | URI template string with optional `{param}` placeholders |
+| `name` | Function name | Resource name |
+| `description` | Docstring | Resource description |
+| `mime_type` | `None` | Optional MIME type override |
+| `icons` | `None` | List of icon descriptor dicts. Each entry is validated via `Icon.model_validate()` at registration time. Only emitted in `resources/list` and `resources/templates/list` for clients negotiating a protocol version of `2025-11-25` or later |
 
 #### register_provider()
 
@@ -584,18 +613,41 @@ PromptRegistry()
 PromptRegistry.prompt(
     name: str | None = None,
     description: str | None = None,
+    icons: list[dict] | None = None,
 ) -> Callable
 ```
 
 Decorator. Registers a sync or async function as a prompt. Arguments are auto-generated from the function signature.
 
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `name` | Function name | Prompt identifier |
+| `description` | Docstring | Prompt description |
+| `icons` | `None` | List of icon descriptor dicts. Each entry is validated via `Icon.model_validate()` at registration time. Only emitted in `prompts/list` for clients negotiating a protocol version of `2025-11-25` or later |
+
 #### list_prompts()
 
 ```python
-PromptRegistry.list_prompts() -> list[dict]
+PromptRegistry.list_prompts(protocol_version: str | None = None) -> list[dict]
 ```
 
-Returns prompt definitions with name, description, and arguments.
+Returns prompt definitions with name, description, arguments, and icons (when provided and `protocol_version` supports them).
+
+#### shape_prompt()
+
+```python
+PromptRegistry.shape_prompt(defn: PromptDefinition, protocol_version: str | None = None) -> dict
+```
+
+Formats a single raw prompt definition for the MCP wire protocol. Extracted from `list_prompts()` so callers that paginate (e.g. `prompts/list` in `router.py`) can shape only the page of prompts being returned instead of the entire registry.
+
+#### get_raw_prompts()
+
+```python
+PromptRegistry.get_raw_prompts() -> list[PromptDefinition]
+```
+
+Returns raw, unshaped prompt definitions in registration order. Enables callers to paginate the raw registry before shaping items to the wire format.
 
 #### get_prompt()
 

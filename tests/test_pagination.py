@@ -10,9 +10,9 @@ Covers:
   offset, across all four paginated list methods.
 - Default page size is 100 for all four list methods; a smaller per-call
   page_size (verified at the handle_tools_list unit level) is honored.
-- Under Accept: text/event-stream, each item streams as its own JSON-RPC
-  partial result, and the final frame carries the authoritative page plus
-  nextCursor/completion, across more than one list method.
+- Under Accept: text/event-stream, a paginated list method streams a single
+  authoritative SSE frame carrying the already-paginated page plus
+  nextCursor/completion, matching the non-SSE JSONResponse contract exactly.
 - title/icons are absent keys (never null) on tools/list when unset.
 - icons are emitted on tools/list only when the negotiated protocol version
   is 2025-11-25 or later; uniformly omitted below that gate.
@@ -374,9 +374,9 @@ def test_handle_tools_list_page_size_is_configurable() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_sse_streams_each_item_as_partial_result_with_final_frame_carrying_next_cursor() -> None:
-    """Under Accept: text/event-stream, each item streams as a partial result
-    and the final frame carries the authoritative page plus nextCursor."""
+async def test_sse_streams_single_authoritative_frame_carrying_next_cursor() -> None:
+    """Under Accept: text/event-stream, tools/list streams exactly one frame
+    carrying the full page plus nextCursor, not one frame per item."""
     store = InMemorySessionStore()
     app = _build_stateful_app(store)
 
@@ -400,14 +400,9 @@ async def test_sse_streams_each_item_as_partial_result_with_final_frame_carrying
 
     frames = [chunk for chunk in "".join(capture.chunks).split("\n\n") if chunk.strip()]
     data_frames = [f for f in frames if "data:" in f]
-    assert len(data_frames) == 101  # 100 partial-result frames + 1 final frame
+    assert len(data_frames) == 1
 
-    payloads = [json.loads(f.split("data: ", 1)[1]) for f in data_frames]
-
-    for partial in payloads[:-1]:
-        assert len(partial["result"]["tools"]) == 1
-
-    final = payloads[-1]
+    final = json.loads(data_frames[0].split("data: ", 1)[1])
     assert len(final["result"]["tools"]) == 100
     assert "nextCursor" in final["result"]
 
@@ -450,6 +445,7 @@ async def test_sse_final_page_frame_omits_next_cursor_key() -> None:
 
     frames = [chunk for chunk in "".join(capture.chunks).split("\n\n") if chunk.strip()]
     data_frames = [f for f in frames if "data:" in f]
+    assert len(data_frames) == 1
     final_payload = json.loads(data_frames[-1].split("data: ", 1)[1])
 
     assert "nextCursor" not in final_payload["result"]
@@ -457,8 +453,8 @@ async def test_sse_final_page_frame_omits_next_cursor_key() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_sse_streams_resources_list_partial_results_with_final_next_cursor() -> None:
-    """SSE partial-result streaming applies to resources/list too, not just tools/list."""
+async def test_sse_streams_resources_list_single_authoritative_frame() -> None:
+    """The single-frame SSE contract applies to resources/list too, not just tools/list."""
     store = InMemorySessionStore()
     app = _build_stateful_app(store)
 
@@ -482,14 +478,9 @@ async def test_sse_streams_resources_list_partial_results_with_final_next_cursor
 
     frames = [chunk for chunk in "".join(capture.chunks).split("\n\n") if chunk.strip()]
     data_frames = [f for f in frames if "data:" in f]
-    assert len(data_frames) == 101  # 100 partial-result frames + 1 final frame
+    assert len(data_frames) == 1
 
-    payloads = [json.loads(f.split("data: ", 1)[1]) for f in data_frames]
-
-    for partial in payloads[:-1]:
-        assert len(partial["result"]["resources"]) == 1
-
-    final = payloads[-1]
+    final = json.loads(data_frames[0].split("data: ", 1)[1])
     assert len(final["result"]["resources"]) == 100
     assert "nextCursor" in final["result"]
 

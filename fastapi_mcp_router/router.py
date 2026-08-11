@@ -27,7 +27,7 @@ import json
 import logging
 import re
 import sys
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -59,6 +59,7 @@ from fastapi_mcp_router.types import (
     ResourceLinkContent,
     ServerInfo,
     TextContent,
+    icons_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,16 +92,6 @@ _MAX_CONCURRENT_ENQUEUES = 50
 # Whitelist of protocol versions this server negotiates, newest first.
 _SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-11-25", "2025-06-18", "2025-03-26")
 
-# List methods that support cursor-based pagination, mapped to the result key
-# holding their page of items. Shared by the JSONResponse and SSE partial-
-# result formatting paths so both stay in sync on page contents/nextCursor.
-_PAGINATED_LIST_RESULT_KEYS: dict[str, str] = {
-    "tools/list": "tools",
-    "resources/list": "resources",
-    "prompts/list": "prompts",
-    "resources/templates/list": "resourceTemplates",
-}
-
 _DEFAULT_PAGE_SIZE = 100
 
 
@@ -128,8 +119,7 @@ def _shape_resource(resource: Resource, protocol_version: str | None = None) -> 
     }
     if resource.mime_type is not None:
         shaped["mimeType"] = resource.mime_type
-    icons_supported = protocol_version is not None and protocol_version >= "2025-11-25"
-    if resource.icons is not None and icons_supported:
+    if resource.icons is not None and icons_supported(protocol_version):
         shaped["icons"] = [icon.model_dump(exclude_none=True) for icon in resource.icons]
     return shaped
 
@@ -161,8 +151,7 @@ def _shape_resource_template(template: ResourceTemplate, protocol_version: str |
     }
     if template.mime_type is not None:
         shaped["mimeType"] = template.mime_type
-    icons_supported = protocol_version is not None and protocol_version >= "2025-11-25"
-    if template.icons is not None and icons_supported:
+    if template.icons is not None and icons_supported(protocol_version):
         shaped["icons"] = [icon.model_dump(exclude_none=True) for icon in template.icons]
     return shaped
 
@@ -238,11 +227,6 @@ def _negotiate_protocol_version(requested: str) -> str:
     return max(eligible)
 
 
-# Content block types whose wire emission requires a negotiated protocol
-# version of at least this value; older negotiated versions omit them.
-_GATED_CONTENT_TYPES = frozenset({"image", "audio", "resource_link"})
-_GATED_CONTENT_MIN_VERSION = "2025-11-25"
-
 _CONTENT_MODEL_BY_TYPE: dict[str, type[BaseModel]] = {
     "text": TextContent,
     "image": ImageContent,
@@ -293,26 +277,28 @@ def _validate_content_data_scheme(data: str, content_type: str) -> None:
 def build_content_block(
     block: TextContent | ImageContent | AudioContent | ResourceLinkContent | dict[str, object],
     negotiated_version: str,
-) -> dict[str, object] | None:
-    """Build a single MCP content block for the wire, gated by protocol version.
+) -> dict[str, object]:
+    """Build a single MCP content block for the wire.
 
     Accepts either a content model instance or an equivalent dict (keyed by a
     ``type`` discriminator: ``"text"``, ``"image"``, ``"audio"``, or
     ``"resource_link"``) and serializes it to the wire shape, omitting unset
-    optional fields rather than emitting them as ``null``. Image, audio, and
-    resource_link blocks are a `2025-11-25`-only surface: for older negotiated
-    versions the block is omitted entirely (returns None) rather than raising,
-    since this is graceful degradation, not a protocol error.
+    optional fields rather than emitting them as ``null``. ``ImageContent``,
+    ``AudioContent``, and ``ResourceLinkContent`` are emitted unconditionally
+    regardless of negotiated protocol version: image content has existed
+    since the first spec revision, audio content was added in `2025-03-26`,
+    and resource links in tool results were added in `2025-06-18`. None of
+    these predate the negotiated version range this router supports, so none
+    are gated. ``negotiated_version`` is retained on the signature for
+    content types that may require version gating in the future.
 
     Args:
         block: Content model instance or dict with a ``type`` discriminator.
         negotiated_version: The protocol version negotiated for this
-            connection (e.g. "2025-11-25"), used to gate image/audio/
-            resource_link emission.
+            connection (e.g. "2025-11-25").
 
     Returns:
-        The wire-shape dict for the block, or None if the block's type is
-        gated and negotiated_version predates the gate.
+        The wire-shape dict for the block.
 
     Raises:
         MCPError: If the block's ``type`` is unrecognized, or if an
@@ -324,16 +310,13 @@ def build_content_block(
         {'type': 'text', 'text': 'hi'}
         >>> build_content_block(
         ...     ImageContent(data="aGVsbG8=", mimeType="image/png"), "2025-06-18"
-        ... ) is None
-        True
+        ... )
+        {'type': 'image', 'data': 'aGVsbG8=', 'mimeType': 'image/png'}
     """
     block_type = _content_block_type(block)
     model_cls = _CONTENT_MODEL_BY_TYPE.get(block_type or "")
     if model_cls is None:
         raise MCPError(code=-32602, message=f"Unknown content block type: {block_type!r}")
-
-    if block_type in _GATED_CONTENT_TYPES and negotiated_version < _GATED_CONTENT_MIN_VERSION:
-        return None
 
     model = block if isinstance(block, model_cls) else model_cls.model_validate(block)
 
@@ -578,6 +561,24 @@ async def _check_authentication(
     return api_key, bearer_token, auth_result
 
 
+def _validate_icons(icons: Sequence[object]) -> None:
+    """Validate a sequence of icon dicts against the Icon scheme/MIME allowlist.
+
+    Shared by `create_mcp_router` (construction-time `server_info` check)
+    and `handle_initialize` (per-request `server_info` check); each caller
+    catches `ValidationError` and re-raises as its own exception type.
+
+    Args:
+        icons: Sequence of icon dicts (or Icon-compatible mappings) to
+            validate.
+
+    Raises:
+        ValidationError: If any icon fails `Icon`'s scheme/MIME validation.
+    """
+    for icon in icons:
+        Icon.model_validate(icon)
+
+
 def create_mcp_router(
     registry: MCPToolRegistry,
     rate_limit_dependency: Callable[..., Awaitable[None]] | None = None,
@@ -724,6 +725,13 @@ def create_mcp_router(
         missing = [key for key in ("resource", "authorization_servers") if key not in oauth_resource_metadata]
         if missing:
             raise ValueError(f"oauth_resource_metadata is missing required keys: {missing}")
+
+    server_info_icons = (server_info or {}).get("icons")
+    if server_info_icons:
+        try:
+            _validate_icons(server_info_icons)
+        except ValidationError as e:
+            raise ValueError(f"Invalid server_info icon: {e}") from e
 
     _tracer: Any = get_tracer(enable_telemetry)
     _meter: Any = get_meter(enable_telemetry)
@@ -1272,7 +1280,7 @@ def create_mcp_router(
         lookup: Callable[[str], Awaitable[object | None]],
         context: str,
         missing_description: str,
-    ) -> str | JSONResponse:
+    ) -> tuple[str, str | None] | JSONResponse:
         """Validate Mcp-Session-Id header and resolve session.
 
         Args:
@@ -1283,7 +1291,9 @@ def create_mcp_router(
             missing_description: Human-readable description when header is missing.
 
         Returns:
-            Validated session ID string on success, JSONResponse on failure.
+            Tuple of (validated session ID, session's stored protocol_version
+            or None if the looked-up session data has no such attribute) on
+            success, or JSONResponse on failure.
         """
         sid = request.headers.get("Mcp-Session-Id")
         if not sid:
@@ -1308,7 +1318,7 @@ def create_mcp_router(
                 },
             )
         logger.info("Session validated for %s: %s", context, sid)
-        return sid
+        return sid, getattr(data, "protocol_version", None)
 
     async def _resolve_session(
         method: str | None,
@@ -1316,11 +1326,33 @@ def create_mcp_router(
         is_oauth_connection: bool,
         body: dict,
         protocol_version: str,
-    ) -> tuple[str | None, str | None] | JSONResponse:
+    ) -> tuple[str | None, str | None, str] | JSONResponse:
         """Resolve session state across 3 mutually exclusive paths.
 
-        Returns (active_session_id, session_id_to_return) on success.
-        Returns JSONResponse on auth/session failure.
+        Returns (active_session_id, session_id_to_return, effective_protocol_version)
+        on success. Returns JSONResponse on auth/session failure.
+
+        For Path 1 (`session_store`) on any method after `initialize`, the
+        effective protocol version is read from the session's stored
+        `protocol_version` (set once at `initialize` time via
+        `SessionStore.create()`) rather than re-derived from the per-request
+        `MCP-Protocol-Version` header. This prevents a session that
+        negotiated a newer version at `initialize` from silently downgrading
+        on a later request where the header is absent or older.
+
+        Path 2 (callback-based `session_getter`/`session_creator`) does NOT
+        get this protection today: `McpSessionData` (the type returned by
+        `session_getter`) has no `protocol_version` field, and `SessionCreator`
+        has no way to receive the negotiated version to store it, so Path 2
+        always falls back to the header-derived `protocol_version` on every
+        request, identical to pre-fix behavior. Closing this gap would
+        require either a breaking `SessionCreator` signature change (passing
+        the negotiated version to consumer code) or router-owned session
+        state with its own lifecycle/eviction concerns that the router does
+        not otherwise manage for Path 2; both are out of scope here. The
+        header-derived `protocol_version` is also used as-is for
+        `initialize` (nothing is stored yet) and for stateless connections
+        (Path 3), where there is no session to consult.
 
         Args:
             method: JSON-RPC method name, or None.
@@ -1328,13 +1360,15 @@ def create_mcp_router(
             is_oauth_connection: True when the connection uses Bearer token auth.
             body: Parsed JSON-RPC request body.
             protocol_version: Negotiated (already clamped) MCP protocol
-                version string, used when creating a new session so the
-                stored value matches what was actually negotiated rather
-                than the raw client-supplied header.
+                version string, derived from the request header. Used when
+                creating a new session so the stored value matches what was
+                actually negotiated, and as the fallback effective version
+                when no session (or no stored version) is available.
 
         Returns:
-            Tuple (active_session_id, session_id_to_return) on success, or
-            JSONResponse on auth/session failure.
+            Tuple (active_session_id, session_id_to_return,
+            effective_protocol_version) on success, or JSONResponse on
+            auth/session failure.
         """
         session_id_to_return: str | None = None
         active_session_id: str | None = None
@@ -1368,18 +1402,18 @@ def create_mcp_router(
                 session_id_to_return = store_new.session_id
                 active_session_id = store_new.session_id
                 logger.info("session_store: new session created via initialize: %s", session_id_to_return)
-            else:
-                result = await _validate_session_header(
-                    request,
-                    method,
-                    session_store.get,
-                    "session_store",
-                    "Mcp-Session-Id header required. Call initialize first.",
-                )
-                if isinstance(result, JSONResponse):
-                    return result
-                active_session_id = result
-            return (active_session_id, session_id_to_return)
+                return (active_session_id, session_id_to_return, protocol_version)
+            result = await _validate_session_header(
+                request,
+                method,
+                session_store.get,
+                "session_store",
+                "Mcp-Session-Id header required. Call initialize first.",
+            )
+            if isinstance(result, JSONResponse):
+                return result
+            active_session_id, session_protocol_version = result
+            return (active_session_id, session_id_to_return, session_protocol_version or protocol_version)
 
         # Path 2: callback-based OAuth path
         if session_getter is not None and session_creator is not None and is_oauth_connection:
@@ -1432,22 +1466,28 @@ def create_mcp_router(
                         },
                     )
                 logger.info("New session created via initialize: %s", session_id_to_return)
-            else:
-                result = await _validate_session_header(
-                    request,
-                    method,
-                    session_getter,
-                    "OAuth connection",
-                    "Mcp-Session-Id header required for OAuth connections. Call initialize first.",
-                )
-                if isinstance(result, JSONResponse):
-                    return result
-                # active_session_id intentionally not set — callback-based sessions do not track it here
+                # McpSessionData has no protocol_version field (unlike SessionStore's
+                # Session), so callback-based sessions cannot persist the negotiated
+                # version; always use the header-derived value here. See the
+                # _resolve_session docstring for why this is a known limitation.
+                return (active_session_id, session_id_to_return, protocol_version)
 
-            return (active_session_id, session_id_to_return)
+            result = await _validate_session_header(
+                request,
+                method,
+                session_getter,
+                "OAuth connection",
+                "Mcp-Session-Id header required for OAuth connections. Call initialize first.",
+            )
+            if isinstance(result, JSONResponse):
+                return result
+            # active_session_id intentionally not set — callback-based sessions do not track it here
+            # McpSessionData has no protocol_version field; always use the header-derived
+            # value here (see the _resolve_session docstring for why).
+            return (active_session_id, session_id_to_return, protocol_version)
 
-        # Path 3: stateless — return (None, None)
-        return (None, None)
+        # Path 3: stateless — no session to consult, use the header-derived version
+        return (None, None, protocol_version)
 
     async def _dispatch_method(
         method: str | None,
@@ -1638,12 +1678,12 @@ def create_mcp_router(
             resources = resource_registry.list_resources()
             templates = resource_registry.list_templates()
             resources_cursor = params.get("cursor") if params else None
-            resources_page, resources_next_cursor = _paginate_or_raise(
-                [_shape_resource(r, protocol_version) for r in resources],
+            resources_page_raw, resources_next_cursor = _paginate_or_raise(
+                resources,
                 str(resources_cursor) if resources_cursor is not None else None,
             )
             resources_result: dict[str, object] = {
-                "resources": resources_page,
+                "resources": [_shape_resource(r, protocol_version) for r in resources_page_raw],
                 "resourceTemplates": [_shape_resource_template(t, protocol_version) for t in templates],
             }
             if resources_next_cursor is not None:
@@ -1655,11 +1695,13 @@ def create_mcp_router(
             if resource_registry is None or not resource_registry.has_resources():
                 raise MCPError(-32601, "Method not found: resources/templates/list")
             templates_cursor = params.get("cursor") if params else None
-            templates_page, templates_next_cursor = _paginate_or_raise(
-                [_shape_resource_template(t, protocol_version) for t in resource_registry.list_templates()],
+            templates_page_raw, templates_next_cursor = _paginate_or_raise(
+                resource_registry.list_templates(),
                 str(templates_cursor) if templates_cursor is not None else None,
             )
-            templates_result: dict[str, object] = {"resourceTemplates": templates_page}
+            templates_result: dict[str, object] = {
+                "resourceTemplates": [_shape_resource_template(t, protocol_version) for t in templates_page_raw]
+            }
             if templates_next_cursor is not None:
                 templates_result["nextCursor"] = templates_next_cursor
             return templates_result
@@ -1686,11 +1728,13 @@ def create_mcp_router(
             if prompt_registry is None or not prompt_registry.has_prompts():
                 raise MCPError(-32601, "Method not found: prompts/list")
             prompts_cursor = params.get("cursor") if params else None
-            prompts_page, prompts_next_cursor = _paginate_or_raise(
-                prompt_registry.list_prompts(protocol_version=protocol_version),
+            prompts_page_raw, prompts_next_cursor = _paginate_or_raise(
+                prompt_registry.get_raw_prompts(),
                 str(prompts_cursor) if prompts_cursor is not None else None,
             )
-            prompts_result: dict[str, object] = {"prompts": prompts_page}
+            prompts_result: dict[str, object] = {
+                "prompts": [prompt_registry.shape_prompt(p, protocol_version) for p in prompts_page_raw]
+            }
             if prompts_next_cursor is not None:
                 prompts_result["nextCursor"] = prompts_next_cursor
             return prompts_result
@@ -1764,23 +1808,20 @@ def create_mcp_router(
         request_id: object,
         request: Request,
         session_id_to_return: str | None,
-        method: str | None = None,
     ) -> JSONResponse | StreamingResponse:
         """Wrap result dict in JSON-RPC envelope, select transport format.
 
         SSE when Accept contains text/event-stream AND session_store is not None.
-        Adds Mcp-Session-Id header when session_id_to_return is not None. When
-        method is a paginated list method, the SSE path streams each page item
-        as its own partial-result frame followed by an authoritative final
-        frame carrying the full page and nextCursor, instead of one single
-        event frame.
+        Adds Mcp-Session-Id header when session_id_to_return is not None.
+        Paginated list methods stream the same single authoritative frame as
+        every other method: the already-paginated page plus nextCursor (when
+        present), never one frame per item.
 
         Args:
             result: Result dict to wrap in JSON-RPC response envelope.
             request_id: JSON-RPC request ID for the response envelope.
             request: FastAPI Request object for reading Accept header.
             session_id_to_return: Session ID to include in response header, or None.
-            method: JSON-RPC method name, used to detect paginated list methods.
 
         Returns:
             StreamingResponse for SSE clients, JSONResponse otherwise.
@@ -1796,14 +1837,6 @@ def create_mcp_router(
                 logger.info(
                     "Including Mcp-Session-Id header in SSE response: %s",
                     session_id_to_return,
-                )
-
-            item_key = _PAGINATED_LIST_RESULT_KEYS.get(method or "")
-            if item_key is not None:
-                return StreamingResponse(
-                    _paginated_list_event_stream(result, request_id, item_key),
-                    media_type="text/event-stream",
-                    headers=sse_headers,
                 )
 
             raw_body = response.body
@@ -1914,6 +1947,15 @@ def create_mcp_router(
               that is less than or equal to the requested version
             - A requested version below all supported versions cannot be
               clamped and returns JSON-RPC error -32602 naming the version
+            - For `session_store`-backed stateful sessions, methods after
+              "initialize" use the protocol version stored on the session at
+              initialize time rather than re-negotiating from the header on
+              every request, preventing a session from silently downgrading
+              if a later request omits or lowers the header. Stateless
+              connections, and callback-based (`session_getter`/
+              `session_creator`) sessions, always use the header-derived
+              version (see `_resolve_session` docstring for why the latter
+              is not yet covered).
 
         Error Handling:
             - MCPError: Returns JSON-RPC error response with error code
@@ -1998,7 +2040,7 @@ def create_mcp_router(
             session_result = await _resolve_session(method, request, is_oauth_connection, body, protocol_version)
             if isinstance(session_result, JSONResponse):
                 return session_result
-            active_session_id, session_id_to_return = session_result
+            active_session_id, session_id_to_return, effective_protocol_version = session_result
 
             # 6. Dispatch
             dispatch_result = await _dispatch_method(
@@ -2009,14 +2051,14 @@ def create_mcp_router(
                 background_tasks,
                 is_oauth_connection,
                 active_session_id,
-                protocol_version,
+                effective_protocol_version,
             )
             if isinstance(dispatch_result, JSONResponse):
                 return dispatch_result
 
             # 7. Format
             logger.info("Returning successful response for method: %s", method)
-            return _format_response(dispatch_result, request_id, request, session_id_to_return, method)
+            return _format_response(dispatch_result, request_id, request, session_id_to_return)
 
         except ValueError as e:
             # ValueError should not occur here since we already parsed the body
@@ -2374,6 +2416,7 @@ class MCPRouter(APIRouter):
         name: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
+        icons: list[dict[str, object]] | None = None,
     ) -> Callable:
         """Decorator to register an async function as an MCP resource handler.
 
@@ -2384,6 +2427,11 @@ class MCPRouter(APIRouter):
             name: Resource name (defaults to function name)
             description: Resource description (defaults to function docstring)
             mime_type: Optional MIME type override
+            icons: Optional list of icon descriptor dicts. Each entry is
+                validated via Icon.model_validate() at registration time.
+                Only emitted in resources/list and resources/templates/list
+                for clients negotiating a protocol version that supports
+                icons.
 
         Returns:
             Decorator that returns the original function unchanged
@@ -2402,6 +2450,7 @@ class MCPRouter(APIRouter):
             name=name,
             description=description,
             mime_type=mime_type,
+            icons=icons,
         )
 
     def prompt(
@@ -2409,6 +2458,7 @@ class MCPRouter(APIRouter):
         name: str | None = None,
         description: str | None = None,
         arguments: list[dict[str, object]] | None = None,
+        icons: list[dict[str, object]] | None = None,
     ) -> Callable:
         """Decorator to register a function as an MCP prompt.
 
@@ -2421,6 +2471,10 @@ class MCPRouter(APIRouter):
             description: Prompt description (defaults to function docstring)
             arguments: Reserved for future use; arguments are auto-generated
                 from the function signature
+            icons: Optional list of icon descriptor dicts. Each entry is
+                validated via Icon.model_validate() at registration time.
+                Only emitted in prompts/list for clients negotiating a
+                protocol version that supports icons.
 
         Returns:
             Decorator that returns the original function unchanged
@@ -2434,6 +2488,7 @@ class MCPRouter(APIRouter):
         return self._prompt_registry.prompt(
             name=name,
             description=description,
+            icons=icons,
         )
 
     def add_resource_provider(self, uri_prefix: str, provider: "ResourceProvider") -> None:
@@ -2598,13 +2653,14 @@ def handle_initialize(
     """
     server_info_icons = (server_info or {}).get("icons")
     if server_info_icons:
-        for icon in server_info_icons:
-            try:
-                Icon.model_validate(icon)
-            except ValidationError as e:
-                raise MCPError(code=-32602, message=f"Invalid server_info icon: {e}") from e
+        try:
+            _validate_icons(server_info_icons)
+        except ValidationError as e:
+            raise MCPError(code=-32602, message=f"Invalid server_info icon: {e}") from e
 
-    default_info: dict[str, object] = {"name": "fastapi-mcp-router", "version": "0.1.0"}
+    from fastapi_mcp_router import __version__  # deferred to avoid circular import
+
+    default_info: dict[str, object] = {"name": "fastapi-mcp-router", "version": __version__}
     return {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {}},
@@ -2612,44 +2668,6 @@ def handle_initialize(
         # Optional: include sessionId for stateful sessions
         # "sessionId": str(uuid.uuid4())
     }
-
-
-async def _paginated_list_event_stream(
-    result: dict,
-    request_id: object,
-    item_key: str,
-) -> AsyncGenerator[str]:
-    """Stream a paginated list result as per-item SSE partial results.
-
-    Reuses the ``id: N\\nevent: message\\ndata: ...\\n\\n`` framing used by the
-    resumable event stream. Each item in the already-paginated page is
-    emitted as its own partial JSON-RPC result frame; the final frame is
-    authoritative and carries the full page plus nextCursor (when present),
-    matching the non-SSE JSONResponse contract exactly.
-
-    Args:
-        result: Already-paginated result dict, e.g. {"tools": [...],
-            "nextCursor": "..."}.
-        request_id: JSON-RPC request ID for the response envelope.
-        item_key: Key in result holding the page's list of items.
-
-    Yields:
-        SSE-formatted strings, one per item plus one final authoritative frame.
-    """
-    items = cast(list, result.get(item_key, []))
-    event_id = 0
-    for item in items:
-        event_id += 1
-        partial_payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {item_key: [item]},
-        }
-        yield f"id: {event_id}\nevent: message\ndata: {json.dumps(partial_payload)}\n\n"
-
-    event_id += 1
-    final_payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
-    yield f"id: {event_id}\nevent: message\ndata: {json.dumps(final_payload)}\n\n"
 
 
 def handle_tools_list(
@@ -2708,11 +2726,11 @@ def handle_tools_list(
         >>> len(result["tools"])
         0
     """
-    tools = registry.list_tools(protocol_version=protocol_version)
+    raw_tools = registry.get_raw_tools()
     if excluded_tools:
-        tools = [t for t in tools if t["name"] not in excluded_tools]
-    page, next_cursor = _paginate_or_raise(tools, cursor, page_size=page_size)
-    result: dict[str, object] = {"tools": page}
+        raw_tools = [t for t in raw_tools if t.name not in excluded_tools]
+    page_raw, next_cursor = _paginate_or_raise(raw_tools, cursor, page_size=page_size)
+    result: dict[str, object] = {"tools": [registry.shape_tool(t, protocol_version) for t in page_raw]}
     if next_cursor is not None:
         result["nextCursor"] = next_cursor
     return result
@@ -2883,12 +2901,10 @@ async def handle_tools_call(
 
         # Tool returned one or more content-block model instances directly
         # (e.g. ImageContent, mixed TextContent + ImageContent) — build each
-        # block through the shared builder so gated types honor the
-        # negotiated version.
+        # block through the shared builder for a consistent wire shape.
         content_blocks = _as_content_blocks(result)
         if content_blocks is not None:
-            built = (build_content_block(block, negotiated_version) for block in content_blocks)
-            return {"content": [b for b in built if b is not None]}
+            return {"content": [build_content_block(block, negotiated_version) for block in content_blocks]}
 
         # Wrap successful result in MCP format
         # Convert dict/list results to JSON string, keep strings as-is

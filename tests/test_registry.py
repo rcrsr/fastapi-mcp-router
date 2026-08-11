@@ -1228,9 +1228,9 @@ def test_list_tools_omits_icons_below_negotiated_version(protocol_version):
 def test_list_tools_annotations_vendor_keys_round_trip_unchanged():
     """Test unknown/vendor annotation keys pass through list_tools() verbatim, no error.
 
-    registry.py stores annotations as an untyped dict (typed ToolAnnotations
-    validation lives in router.py per the module boundary contract), so an
-    unrecognized key must survive unmodified with no exception raised.
+    registry.py validates annotations via ToolAnnotations.model_validate() at
+    registration time, but ToolAnnotations allows extra fields (extra="allow"),
+    so an unrecognized key must survive unmodified with no exception raised.
     """
     registry = MCPToolRegistry()
 
