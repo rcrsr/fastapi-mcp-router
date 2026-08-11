@@ -5,11 +5,18 @@ Tests the json_rpc_response and json_rpc_error helper functions to ensure
 compliance with JSON-RPC 2.0 specification.
 """
 
+import base64
 import json
 
 import pytest
 
-from fastapi_mcp_router.protocol import json_rpc_error, json_rpc_response
+from fastapi_mcp_router.protocol import (
+    decode_cursor,
+    encode_cursor,
+    json_rpc_error,
+    json_rpc_response,
+    paginate,
+)
 
 # ============================================================================
 # Tests for json_rpc_response()
@@ -421,3 +428,177 @@ def test_json_rpc_error_standard_codes(code: int, message: str):
     body = json.loads(response.body)
     assert body["error"]["code"] == code
     assert body["error"]["message"] == message
+
+
+# ============================================================================
+# Tests for encode_cursor() / decode_cursor()
+# ============================================================================
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "offset",
+    [0, 1, 42, 100, 999_999, 2**32, 2**63 - 1],
+)
+def test_decode_cursor_round_trips_encode_cursor(offset: int):
+    """Test decode_cursor recovers the exact offset passed to encode_cursor."""
+    cursor = encode_cursor(offset)
+
+    assert decode_cursor(cursor) == offset
+
+
+@pytest.mark.unit
+def test_encode_cursor_returns_string():
+    """Test encode_cursor returns a string token."""
+    cursor = encode_cursor(5)
+
+    assert isinstance(cursor, str)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("offset", [0, 5, 42, 12345])
+def test_encode_cursor_base64_decode_hides_offset_digits(offset: int):
+    """Test base64-decoding a cursor does not expose the offset as plaintext digits."""
+    cursor = encode_cursor(offset)
+
+    decoded_bytes = base64.urlsafe_b64decode(cursor.encode("ascii"))
+
+    assert str(offset).encode("ascii") not in decoded_bytes
+
+
+@pytest.mark.unit
+def test_encode_cursor_base64_decode_hides_item_keys():
+    """Test base64-decoding a cursor exposes no item-related plaintext."""
+    items = ["secret-item-key", "another-key"]
+    _, cursor = paginate(items, None, page_size=1)
+
+    assert cursor is not None
+    decoded_bytes = base64.urlsafe_b64decode(cursor.encode("ascii"))
+
+    assert b"secret-item-key" not in decoded_bytes
+    assert b"another-key" not in decoded_bytes
+
+
+@pytest.mark.unit
+def test_decode_cursor_raises_on_malformed_input():
+    """Test decode_cursor raises for a cursor string that is not valid base64."""
+    with pytest.raises(ValueError):
+        decode_cursor("not-a-valid-cursor!!!")
+
+
+@pytest.mark.unit
+def test_decode_cursor_error_does_not_echo_offset():
+    """Test the exception raised for a malformed cursor contains no decoded offset."""
+    malformed_cursor = base64.urlsafe_b64encode(b"12345").decode("ascii")
+
+    with pytest.raises(ValueError) as exc_info:
+        decode_cursor(malformed_cursor)
+
+    assert "12345" not in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_encode_cursor_raises_value_error_on_negative_offset():
+    """Test encode_cursor raises ValueError, not OverflowError, for a negative offset."""
+    with pytest.raises(ValueError):
+        encode_cursor(-1)
+
+
+# ============================================================================
+# Tests for paginate()
+# ============================================================================
+
+
+@pytest.mark.unit
+def test_paginate_empty_list_returns_empty_page():
+    """Test paginate on an empty list returns an empty page and no next cursor."""
+    page, next_cursor = paginate([], None)
+
+    assert page == []
+    assert next_cursor is None
+
+
+@pytest.mark.unit
+def test_paginate_exact_page_size_has_no_next_cursor():
+    """Test a list exactly page_size long yields no trailing empty page."""
+    items = list(range(100))
+
+    page, next_cursor = paginate(items, None)
+
+    assert page == items
+    assert next_cursor is None
+
+
+@pytest.mark.unit
+def test_paginate_multi_page_list_returns_next_cursor():
+    """Test a list larger than one page returns a usable next cursor."""
+    items = list(range(150))
+
+    first_page, next_cursor = paginate(items, None)
+    assert first_page == items[:100]
+    assert next_cursor is not None
+
+    second_page, final_cursor = paginate(items, next_cursor)
+    assert second_page == items[100:150]
+    assert final_cursor is None
+
+
+@pytest.mark.unit
+def test_paginate_default_page_size_is_100():
+    """Test paginate defaults to a page size of 100 when unspecified."""
+    items = list(range(250))
+
+    page, _ = paginate(items, None)
+
+    assert len(page) == 100
+
+
+@pytest.mark.unit
+def test_paginate_page_size_override():
+    """Test a supplied page_size overrides the default of 100."""
+    items = list(range(250))
+
+    page, next_cursor = paginate(items, None, page_size=10)
+
+    assert len(page) == 10
+    assert next_cursor is not None
+
+
+@pytest.mark.unit
+def test_paginate_mutation_between_calls_skips_without_error():
+    """Test items removed between calls cause skipped items but never raise."""
+    items = list(range(10))
+
+    first_page, next_cursor = paginate(items, None, page_size=5)
+    assert first_page == [0, 1, 2, 3, 4]
+
+    del items[0:5]
+
+    second_page, final_cursor = paginate(items, next_cursor, page_size=5)
+
+    assert second_page == []
+    assert final_cursor is None
+
+
+@pytest.mark.unit
+def test_paginate_mutation_between_calls_repeats_without_error():
+    """Test items inserted between calls cause repeated items but never raise."""
+    items = list(range(10))
+
+    first_page, next_cursor = paginate(items, None, page_size=5)
+    assert first_page == [0, 1, 2, 3, 4]
+
+    items.insert(0, -1)
+
+    second_page, final_cursor = paginate(items, next_cursor, page_size=5)
+
+    assert second_page == [4, 5, 6, 7, 8]
+    assert final_cursor is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("page_size", [0, -1, -10])
+def test_paginate_raises_value_error_on_non_positive_page_size(page_size: int):
+    """Test paginate rejects a zero or negative page_size instead of stalling or slicing backward."""
+    with pytest.raises(ValueError):
+        paginate(list(range(10)), None, page_size=page_size)

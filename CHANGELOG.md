@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** `SessionStore` ABC adds two new required abstract methods, `list_sessions()` and `find_subscribers()`; downstream custom `SessionStore` implementations must implement both to remain instantiable
+- **BREAKING:** Server-hosted `roots/list` handling is removed. The `roots_manager` parameter and its `RootsManager()` default are gone from `create_mcp_router()`, and `RootsManager` (`session.py`) and `Root` (`types.py`) no longer exist. A `roots/list` request now falls through to the generic unknown-method path and returns a JSON-RPC `-32601` error. Neither symbol was previously exported in `__all__`, so this affects only callers that passed `roots_manager=` directly.
+
+  This removes functionality that was never spec-conformant: the MCP specification defines `roots/list` as a request the *server* sends to the *client* to discover the client's workspace roots — a client capability, not an inbound method a server handles. This library's server-hosted implementation inverted that direction. Roots itself is deprecated as of the `2026-07-28` MCP specification revision, with implementations encouraged to migrate toward passing directories or files via tool parameters, resource URIs, or server configuration instead. No server-side replacement is offered here — that is intentional, since a conformant client-hosted roots capability is outside this server library's scope.
+
+  This ships as a `0.4.0` minor release rather than a major version because the project is still in SemVer's `0.x` initial-development phase, where the public API is explicitly unstable and a disclosed breaking change may ship in a minor release.
+
 ## [0.3.1] - 2026-04-07
 
 ### Fixed

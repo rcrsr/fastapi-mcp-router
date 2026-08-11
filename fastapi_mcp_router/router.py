@@ -3,11 +3,16 @@ FastAPI router factory for MCP JSON-RPC protocol.
 
 This module provides the main router factory function that creates a configured
 FastAPI APIRouter for handling MCP JSON-RPC requests over HTTP. The router
-implements stateless HTTP transport with strict protocol version validation.
+negotiates the protocol version against a three-entry whitelist —
+`2025-11-25`, `2025-06-18`, `2025-03-26` — clamping any requested version
+down to the highest whitelisted version that is less than or equal to it
+(rejecting with a protocol error if none qualifies), rather than accepting
+a single version strictly.
 
 Key features:
 - JSON-RPC 2.0 request/response handling
-- MCP protocol version 2025-06-18 support
+- MCP protocol version negotiation across 2025-11-25, 2025-06-18, and
+  2025-03-26, with clamping to the highest mutually supported version
 - Tool registration via MCPToolRegistry
 - Comprehensive error handling for protocol and business logic errors
 
@@ -20,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, cast
@@ -27,24 +33,33 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ValidationError
 from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from fastapi_mcp_router.exceptions import MCPError, ToolError
 from fastapi_mcp_router.prompts import PromptRegistry
-from fastapi_mcp_router.protocol import json_rpc_error, json_rpc_response
+from fastapi_mcp_router.protocol import json_rpc_error, json_rpc_response, paginate
 from fastapi_mcp_router.registry import MCPToolRegistry
-from fastapi_mcp_router.resources import ResourceProvider, ResourceRegistry
+from fastapi_mcp_router.resources import Resource, ResourceProvider, ResourceRegistry, ResourceTemplate
 from fastapi_mcp_router.session import (
     _SUBSCRIPTIONS_MAX,
     MCPLoggingHandler,
     ProgressTracker,
-    RootsManager,
     SamplingManager,
     SessionStore,
 )
 from fastapi_mcp_router.telemetry import get_meter, get_tracer
-from fastapi_mcp_router.types import EventSubscriber, McpSessionData, ServerInfo
+from fastapi_mcp_router.types import (
+    AudioContent,
+    EventSubscriber,
+    Icon,
+    ImageContent,
+    McpSessionData,
+    ResourceLinkContent,
+    ServerInfo,
+    TextContent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +79,297 @@ ToolFilter = Callable[[bool], list[str] | None]
 CompletionHandler = Callable[[dict, dict], Awaitable[dict[str, object]]]
 
 _ELICITATION_TIMEOUT = 30.0
+
+# Upper bound on concurrent enqueue_message() calls during a notification
+# fan-out (notify_resource_updated / _broadcast_list_changed). No numeric
+# concurrency target is specified anywhere in the project; this value caps
+# in-flight Redis/store operations to a conservative fraction of a typical
+# connection pool size so a large subscriber/session count cannot open an
+# unbounded number of simultaneous requests.
+_MAX_CONCURRENT_ENQUEUES = 50
+
+# Whitelist of protocol versions this server negotiates, newest first.
+_SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-11-25", "2025-06-18", "2025-03-26")
+
+# List methods that support cursor-based pagination, mapped to the result key
+# holding their page of items. Shared by the JSONResponse and SSE partial-
+# result formatting paths so both stay in sync on page contents/nextCursor.
+_PAGINATED_LIST_RESULT_KEYS: dict[str, str] = {
+    "tools/list": "tools",
+    "resources/list": "resources",
+    "prompts/list": "prompts",
+    "resources/templates/list": "resourceTemplates",
+}
+
+_DEFAULT_PAGE_SIZE = 100
+
+
+def _shape_resource(resource: Resource, protocol_version: str | None = None) -> dict[str, object]:
+    """Format a resource for the MCP wire protocol.
+
+    Optional fields that are unset are omitted rather than emitted as
+    ``null``. Icons are only emitted when the negotiated protocol_version
+    supports them ("2025-11-25" or later); the default of None omits icons
+    regardless of whether the resource defines them.
+
+    Args:
+        resource: Resource to format.
+        protocol_version: Negotiated MCP protocol version string. Controls
+            whether icons are emitted.
+
+    Returns:
+        Dict with uri, name, description, mimeType (omitted when unset), and
+        icons (omitted when unset or unsupported by protocol_version).
+    """
+    shaped: dict[str, object] = {
+        "uri": resource.uri,
+        "name": resource.name,
+        "description": resource.description,
+    }
+    if resource.mime_type is not None:
+        shaped["mimeType"] = resource.mime_type
+    icons_supported = protocol_version is not None and protocol_version >= "2025-11-25"
+    if resource.icons is not None and icons_supported:
+        shaped["icons"] = [icon.model_dump(exclude_none=True) for icon in resource.icons]
+    return shaped
+
+
+def _shape_resource_template(template: ResourceTemplate, protocol_version: str | None = None) -> dict[str, object]:
+    """Format a resource template for the MCP wire protocol.
+
+    Shared by the ``resources/list`` inline ``resourceTemplates`` bundle and
+    the ``resources/templates/list`` method so both surfaces emit identical
+    shapes. Optional fields that are unset are omitted rather than emitted
+    as ``null``. Icons are only emitted when the negotiated protocol_version
+    supports them ("2025-11-25" or later); the default of None omits icons
+    regardless of whether the template defines them.
+
+    Args:
+        template: Resource template to format.
+        protocol_version: Negotiated MCP protocol version string. Controls
+            whether icons are emitted.
+
+    Returns:
+        Dict with uriTemplate, name, description, mimeType (omitted when
+        unset), and icons (omitted when unset or unsupported by
+        protocol_version).
+    """
+    shaped: dict[str, object] = {
+        "uriTemplate": template.uri_template,
+        "name": template.name,
+        "description": template.description,
+    }
+    if template.mime_type is not None:
+        shaped["mimeType"] = template.mime_type
+    icons_supported = protocol_version is not None and protocol_version >= "2025-11-25"
+    if template.icons is not None and icons_supported:
+        shaped["icons"] = [icon.model_dump(exclude_none=True) for icon in template.icons]
+    return shaped
+
+
+def _paginate_or_raise(
+    items: list,
+    cursor: str | None,
+    page_size: int = _DEFAULT_PAGE_SIZE,
+) -> tuple[list, str | None]:
+    """Paginate a list, converting cursor decode failures to protocol errors.
+
+    Args:
+        items: Full list of entries to paginate.
+        cursor: Opaque cursor from a previous page, or None for the first page.
+        page_size: Maximum number of items to return in this page.
+
+    Returns:
+        Tuple of (page, next_cursor). next_cursor is None on the final page.
+
+    Raises:
+        MCPError: If cursor is malformed or cannot be decoded. The message
+            names the failure as an invalid cursor without echoing the
+            decoded offset.
+    """
+    try:
+        return paginate(items, cursor, page_size=page_size)
+    except ValueError as e:
+        raise MCPError(code=-32602, message="Invalid params: malformed pagination cursor") from e
+
+
+def _negotiate_protocol_version(requested: str) -> str:
+    """Clamp a requested protocol version to the nearest supported version.
+
+    Applies ISO-date lexicographic comparison across the supported whitelist:
+    the negotiated version is the highest supported version that is less than
+    or equal to the requested version.
+
+    Args:
+        requested: Client-requested protocol version string.
+
+    Returns:
+        The negotiated (clamped) protocol version string.
+
+    Raises:
+        MCPError: If the requested version does not match the `YYYY-MM-DD`
+            shape, or is below all supported versions.
+
+    Example:
+        >>> _negotiate_protocol_version("2026-07-28")
+        '2025-11-25'
+        >>> _negotiate_protocol_version("2025-08-01")
+        '2025-06-18'
+    """
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested):
+        raise MCPError(
+            code=-32602,
+            message=f"Unsupported protocol version: {requested}",
+            data={
+                "supported": list(_SUPPORTED_PROTOCOL_VERSIONS),
+                "requested": requested,
+            },
+        )
+    eligible = [version for version in _SUPPORTED_PROTOCOL_VERSIONS if version <= requested]
+    if not eligible:
+        raise MCPError(
+            code=-32602,
+            message=f"Unsupported protocol version: {requested}",
+            data={
+                "supported": list(_SUPPORTED_PROTOCOL_VERSIONS),
+                "requested": requested,
+            },
+        )
+    return max(eligible)
+
+
+# Content block types whose wire emission requires a negotiated protocol
+# version of at least this value; older negotiated versions omit them.
+_GATED_CONTENT_TYPES = frozenset({"image", "audio", "resource_link"})
+_GATED_CONTENT_MIN_VERSION = "2025-11-25"
+
+_CONTENT_MODEL_BY_TYPE: dict[str, type[BaseModel]] = {
+    "text": TextContent,
+    "image": ImageContent,
+    "audio": AudioContent,
+    "resource_link": ResourceLinkContent,
+}
+
+
+def _content_block_type(
+    block: TextContent | ImageContent | AudioContent | ResourceLinkContent | dict[str, object],
+) -> str | None:
+    """Read the ``type`` discriminator off a content block instance or dict."""
+    if isinstance(block, dict):
+        block_type = block.get("type")
+    else:
+        block_type = block.type
+    return block_type if isinstance(block_type, str) else None
+
+
+def _validate_content_data_scheme(data: str, content_type: str) -> None:
+    """Reject image/audio ``data`` values that carry a URI scheme.
+
+    The flat wire shape stores raw base64 in ``data`` (never a ``data:`` URI
+    or other scheme-prefixed value). Base64's alphabet excludes ``:``, so any
+    colon before a comma/slash indicates the caller passed a URL instead of
+    base64 payload.
+
+    Args:
+        data: The candidate base64 payload.
+        content_type: The content block type ("image" or "audio"), used to
+            name the offending field in the error message.
+
+    Raises:
+        MCPError: If ``data`` contains a URI scheme prefix.
+    """
+    scheme_candidate = data.split(",", 1)[0]
+    if ":" not in scheme_candidate:
+        return
+    scheme = scheme_candidate.split(":", 1)[0]
+    raise MCPError(
+        code=-32602,
+        message=(
+            f"Invalid {content_type} content: 'data' must be a raw base64-encoded string, not a {scheme!r} scheme value"
+        ),
+    )
+
+
+def build_content_block(
+    block: TextContent | ImageContent | AudioContent | ResourceLinkContent | dict[str, object],
+    negotiated_version: str,
+) -> dict[str, object] | None:
+    """Build a single MCP content block for the wire, gated by protocol version.
+
+    Accepts either a content model instance or an equivalent dict (keyed by a
+    ``type`` discriminator: ``"text"``, ``"image"``, ``"audio"``, or
+    ``"resource_link"``) and serializes it to the wire shape, omitting unset
+    optional fields rather than emitting them as ``null``. Image, audio, and
+    resource_link blocks are a `2025-11-25`-only surface: for older negotiated
+    versions the block is omitted entirely (returns None) rather than raising,
+    since this is graceful degradation, not a protocol error.
+
+    Args:
+        block: Content model instance or dict with a ``type`` discriminator.
+        negotiated_version: The protocol version negotiated for this
+            connection (e.g. "2025-11-25"), used to gate image/audio/
+            resource_link emission.
+
+    Returns:
+        The wire-shape dict for the block, or None if the block's type is
+        gated and negotiated_version predates the gate.
+
+    Raises:
+        MCPError: If the block's ``type`` is unrecognized, or if an
+            image/audio block's ``data`` field carries a URI scheme instead
+            of raw base64.
+
+    Example:
+        >>> build_content_block(TextContent(text="hi"), "2025-06-18")
+        {'type': 'text', 'text': 'hi'}
+        >>> build_content_block(
+        ...     ImageContent(data="aGVsbG8=", mimeType="image/png"), "2025-06-18"
+        ... ) is None
+        True
+    """
+    block_type = _content_block_type(block)
+    model_cls = _CONTENT_MODEL_BY_TYPE.get(block_type or "")
+    if model_cls is None:
+        raise MCPError(code=-32602, message=f"Unknown content block type: {block_type!r}")
+
+    if block_type in _GATED_CONTENT_TYPES and negotiated_version < _GATED_CONTENT_MIN_VERSION:
+        return None
+
+    model = block if isinstance(block, model_cls) else model_cls.model_validate(block)
+
+    if isinstance(model, (ImageContent, AudioContent)):
+        _validate_content_data_scheme(model.data, model.type)
+
+    return model.model_dump(exclude_none=True)
+
+
+_CONTENT_BLOCK_MODEL_TYPES: tuple[
+    type[TextContent], type[ImageContent], type[AudioContent], type[ResourceLinkContent]
+] = (TextContent, ImageContent, AudioContent, ResourceLinkContent)
+
+
+def _as_content_blocks(
+    result: object,
+) -> list[TextContent | ImageContent | AudioContent | ResourceLinkContent] | None:
+    """Recognize a tool result as one or more content-block model instances.
+
+    A tool may return a single content-block instance (e.g. ``ImageContent``)
+    or a list mixing content-block instances (e.g. ``[ImageContent(...),
+    TextContent(...)]``) to emit multiple blocks in one response.
+
+    Args:
+        result: The raw value returned by a tool handler.
+
+    Returns:
+        A list of content-block instances if ``result`` matches one of the
+        recognized shapes, otherwise None so the caller falls back to
+        JSON/text wrapping.
+    """
+    if isinstance(result, _CONTENT_BLOCK_MODEL_TYPES):
+        return [result]
+    if isinstance(result, list) and result and all(isinstance(item, _CONTENT_BLOCK_MODEL_TYPES) for item in result):
+        return cast("list[TextContent | ImageContent | AudioContent | ResourceLinkContent]", result)
+    return None
 
 
 class ElicitationManager:
@@ -118,7 +424,7 @@ class ElicitationManager:
             Dict with action ("accept", "decline", "cancel") and optional content.
 
         Raises:
-            MCPError: -32603 if the client does not respond within 30 seconds (EC-25).
+            MCPError: -32603 if the client does not respond within 30 seconds.
         """
         request_id = str(uuid4())
         notification: dict[str, object] = {
@@ -137,7 +443,7 @@ class ElicitationManager:
             client_response = await asyncio.wait_for(future, timeout=_ELICITATION_TIMEOUT)
             action = client_response.get("action", "cancel")
             content = client_response.get("content")
-            # Validate content against requestedSchema only for accept action (AC-65)
+            # Validate content against requestedSchema only for accept action
             if action == "accept" and content is not None:
                 _validate_elicitation_content(content, requested_schema)
             return {"action": action, "content": content}
@@ -288,7 +594,6 @@ def create_mcp_router(
     resource_registry: ResourceRegistry | None = None,
     prompt_registry: PromptRegistry | None = None,
     sampling_enabled: bool = False,
-    roots_manager: RootsManager | None = None,
     completion_handler: Callable[..., Awaitable[object]] | None = None,
     legacy_sse: bool = False,
     enable_telemetry: bool = True,
@@ -350,8 +655,6 @@ def create_mcp_router(
             provided.
         stateful: If True, enables stateful SSE mode. Requires session_store
             to be provided. Raises ValueError if True and session_store is None.
-        roots_manager: Optional RootsManager instance for pre-populating roots
-            before router creation. If None, a new empty RootsManager is created.
         completion_handler: Optional async callable for completion/complete requests.
             Takes (ref, argument) and returns a dict with a "values" key (list).
             If None, completion/complete returns -32601 Method not found.
@@ -435,16 +738,13 @@ def create_mcp_router(
 
     router = APIRouter()
 
-    # Create ProgressTracker for stateful mode; None in stateless mode (AC-42, AC-43)
+    # Create ProgressTracker for stateful mode; None in stateless mode
     _progress_tracker = ProgressTracker(session_store=session_store) if session_store is not None else None
 
-    # Create SamplingManager for stateful mode; None in stateless mode (EC-19)
+    # Create SamplingManager for stateful mode; None in stateless mode
     _sampling_manager = SamplingManager(session_store, sampling_enabled) if session_store is not None else None
 
-    # RootsManager has no stateful requirement; use injected instance if provided
-    _roots_manager = roots_manager if roots_manager is not None else RootsManager()
-
-    # Create MCPLoggingHandler for stateful mode; None in stateless mode (EC-23)
+    # Create MCPLoggingHandler for stateful mode; None in stateless mode
     _logging_handler = MCPLoggingHandler(session_store) if session_store is not None else None
 
     # Create ElicitationManager for stateful mode; None in stateless mode
@@ -582,7 +882,7 @@ def create_mcp_router(
                     """
                     Generate SSE events merging event_subscriber and dequeue_messages.
 
-                    Polls session_store.dequeue_messages() every 1s (IC-8) and
+                    Polls session_store.dequeue_messages() every 1s and
                     delivers application events from event_subscriber. Sends a
                     keepalive comment every 30s when no events arrive.
 
@@ -614,7 +914,7 @@ def create_mcp_router(
                                 await asyncio.sleep(1)
                                 keepalive_ticks += 1
 
-                            # IC-8: poll dequeue_messages every 1s
+                            # poll dequeue_messages every 1s
                             try:
                                 messages = await session_store.dequeue_messages(store_sid)
                             except MCPError as e:
@@ -677,7 +977,7 @@ def create_mcp_router(
                     content={
                         "service": "MCP Server",
                         "transport": "HTTP (stateless)",
-                        "supportedVersions": ["2025-06-18", "2025-03-26"],
+                        "supportedVersions": list(_SUPPORTED_PROTOCOL_VERSIONS),
                         "info": (
                             "This is an MCP (Model Context Protocol) server endpoint. "
                             "Send POST requests with JSON-RPC 2.0 payloads."
@@ -784,8 +1084,8 @@ def create_mcp_router(
                 logger.info("New session created: %s", session_id)
 
             # Extract Last-Event-ID for SSE resumption.
-            # Per AC-95: header "0" -> int 0 (not None).
-            # Per AC-96: header absent -> None.
+            # Header "0" -> int 0 (not None).
+            # Header absent -> None.
             last_event_id_header = request.headers.get("Last-Event-ID")
             if last_event_id_header is not None:
                 try:
@@ -822,7 +1122,7 @@ def create_mcp_router(
 
                 try:
                     if gen is None:
-                        # AC-6: keepalive-only stream when no subscriber provided.
+                        # keepalive-only stream when no subscriber provided.
                         while shutdown_event is None or not shutdown_event.is_set():
                             if shutdown_event is not None:
                                 try:
@@ -835,7 +1135,7 @@ def create_mcp_router(
                                 await asyncio.sleep(30)
                             yield ": keepalive\n\n"
                     else:
-                        # AC-1/AC-4: deliver events; keepalive fires every 30s between events.
+                        # deliver events; keepalive fires every 30s between events.
                         # Poll every 1s so shutdown_event is checked promptly.
                         keepalive_ticks = 0
                         while shutdown_event is None or not shutdown_event.is_set():
@@ -845,12 +1145,12 @@ def create_mcp_router(
                                 keepalive_ticks = 0
                             except TimeoutError:
                                 keepalive_ticks += 1
-                                # AC-4: 30s elapsed without an event — send keepalive.
+                                # 30s elapsed without an event — send keepalive.
                                 if keepalive_ticks >= 30:
                                     yield ": keepalive\n\n"
                                     keepalive_ticks = 0
                             except StopAsyncIteration:
-                                # AC-87: empty or exhausted generator — close stream cleanly.
+                                # empty or exhausted generator — close stream cleanly.
                                 break
 
                     # Shutdown requested — notify client and close stream.
@@ -859,7 +1159,7 @@ def create_mcp_router(
                         if gen is not None:
                             await gen.aclose()
                 except asyncio.CancelledError:
-                    # AC-5: client disconnected — log session ID, do not crash.
+                    # client disconnected — log session ID, do not crash.
                     logger.info("SSE stream cancelled for session: %s", session_label)
                     if gen is not None:
                         await gen.aclose()
@@ -879,7 +1179,7 @@ def create_mcp_router(
     @router.delete("", dependencies=dependencies, status_code=204)
     async def delete_mcp_session(request: Request) -> Response:
         """
-        Delete an MCP session by session ID (AC-18, AC-19).
+        Delete an MCP session by session ID.
 
         Args:
             request: FastAPI Request object containing Mcp-Session-Id header
@@ -1015,6 +1315,7 @@ def create_mcp_router(
         request: Request,
         is_oauth_connection: bool,
         body: dict,
+        protocol_version: str,
     ) -> tuple[str | None, str | None] | JSONResponse:
         """Resolve session state across 3 mutually exclusive paths.
 
@@ -1026,6 +1327,10 @@ def create_mcp_router(
             request: FastAPI Request object.
             is_oauth_connection: True when the connection uses Bearer token auth.
             body: Parsed JSON-RPC request body.
+            protocol_version: Negotiated (already clamped) MCP protocol
+                version string, used when creating a new session so the
+                stored value matches what was actually negotiated rather
+                than the raw client-supplied header.
 
         Returns:
             Tuple (active_session_id, session_id_to_return) on success, or
@@ -1052,12 +1357,11 @@ def create_mcp_router(
         # Path 1: session_store path — create session on initialize, validate on other methods
         if session_store is not None:
             if method == "initialize":
-                protocol_ver_hdr = request.headers.get("MCP-Protocol-Version", "2025-03-26")
                 _init_params = body.get("params", {})
                 client_info = _init_params.get("clientInfo", {})
                 capabilities_req = _init_params.get("capabilities", {})
                 store_new = await session_store.create(
-                    protocol_version=protocol_ver_hdr,
+                    protocol_version=protocol_version,
                     client_info=client_info,
                     capabilities=capabilities_req,
                 )
@@ -1196,23 +1500,35 @@ def create_mcp_router(
             )
             result = handle_initialize(params, protocol_version, server_info)
             capabilities = dict(cast(dict[str, object], result["capabilities"]))
+            if session_store is not None:
+                capabilities["tools"] = {"listChanged": True}
             if resource_registry is not None and resource_registry.has_resources():
-                capabilities["resources"] = {}
+                capabilities["resources"] = (
+                    {"subscribe": True, "listChanged": True} if session_store is not None else {}
+                )
             if prompt_registry is not None and prompt_registry.has_prompts():
-                capabilities["prompts"] = {}
+                capabilities["prompts"] = {"listChanged": True} if session_store is not None else {}
+            if session_store is not None:
+                capabilities["logging"] = {}
             return {**result, "capabilities": capabilities}
 
         if method == "tools/list":
             logger.info("Handling tools/list request")
             excluded = tool_filter(is_oauth_connection) if tool_filter else None
-            return handle_tools_list(registry, excluded_tools=excluded)
+            list_cursor = params.get("cursor") if params else None
+            return handle_tools_list(
+                registry,
+                excluded_tools=excluded,
+                cursor=str(list_cursor) if list_cursor is not None else None,
+                protocol_version=protocol_version,
+            )
 
         if method == "tools/call":
             logger.info("Handling tools/call request: %s", params.get("name"))
             tool_name = params.get("name") if params else None
 
-            # IR-6: create OTel span for tools/call when tracer is available.
-            # EC-4: span creation failure must not break request handling.
+            # create OTel span for tools/call when tracer is available.
+            # span creation failure must not break request handling.
             _tracer_any = cast(Any, _tracer)
             _span_cm: Any = None
             _span: Any = None
@@ -1229,8 +1545,8 @@ def create_mcp_router(
                     _span_cm = None
                     _span = None
 
-            # AC-42: create per-request progress callback in stateful mode
-            # AC-43: pass None in stateless mode (registry injects no-op)
+            # create per-request progress callback in stateful mode
+            # pass None in stateless mode (registry injects no-op)
             try:
                 if _progress_tracker is not None and active_session_id is not None:
                     _meta = params.get("_meta")
@@ -1268,6 +1584,7 @@ def create_mcp_router(
                     session_id=active_session_id,
                     progress_callback=progress_cb,
                     sampling_manager=_sampling_manager,
+                    negotiated_version=protocol_version,
                 )
             except Exception as _tools_call_exc:
                 if _span is not None:
@@ -1320,26 +1637,32 @@ def create_mcp_router(
                 raise MCPError(-32601, "Method not found: resources/list")
             resources = resource_registry.list_resources()
             templates = resource_registry.list_templates()
-            return {
-                "resources": [
-                    {
-                        "uri": r.uri,
-                        "name": r.name,
-                        "description": r.description,
-                        "mimeType": r.mime_type,
-                    }
-                    for r in resources
-                ],
-                "resourceTemplates": [
-                    {
-                        "uriTemplate": t.uri_template,
-                        "name": t.name,
-                        "description": t.description,
-                        "mimeType": t.mime_type,
-                    }
-                    for t in templates
-                ],
+            resources_cursor = params.get("cursor") if params else None
+            resources_page, resources_next_cursor = _paginate_or_raise(
+                [_shape_resource(r, protocol_version) for r in resources],
+                str(resources_cursor) if resources_cursor is not None else None,
+            )
+            resources_result: dict[str, object] = {
+                "resources": resources_page,
+                "resourceTemplates": [_shape_resource_template(t, protocol_version) for t in templates],
             }
+            if resources_next_cursor is not None:
+                resources_result["nextCursor"] = resources_next_cursor
+            return resources_result
+
+        if method == "resources/templates/list":
+            logger.info("Handling resources/templates/list request")
+            if resource_registry is None or not resource_registry.has_resources():
+                raise MCPError(-32601, "Method not found: resources/templates/list")
+            templates_cursor = params.get("cursor") if params else None
+            templates_page, templates_next_cursor = _paginate_or_raise(
+                [_shape_resource_template(t, protocol_version) for t in resource_registry.list_templates()],
+                str(templates_cursor) if templates_cursor is not None else None,
+            )
+            templates_result: dict[str, object] = {"resourceTemplates": templates_page}
+            if templates_next_cursor is not None:
+                templates_result["nextCursor"] = templates_next_cursor
+            return templates_result
 
         if method == "resources/read":
             logger.info("Handling resources/read request")
@@ -1362,7 +1685,15 @@ def create_mcp_router(
             logger.info("Handling prompts/list request")
             if prompt_registry is None or not prompt_registry.has_prompts():
                 raise MCPError(-32601, "Method not found: prompts/list")
-            return {"prompts": prompt_registry.list_prompts()}
+            prompts_cursor = params.get("cursor") if params else None
+            prompts_page, prompts_next_cursor = _paginate_or_raise(
+                prompt_registry.list_prompts(protocol_version=protocol_version),
+                str(prompts_cursor) if prompts_cursor is not None else None,
+            )
+            prompts_result: dict[str, object] = {"prompts": prompts_page}
+            if prompts_next_cursor is not None:
+                prompts_result["nextCursor"] = prompts_next_cursor
+            return prompts_result
 
         if method == "prompts/get":
             logger.info("Handling prompts/get request")
@@ -1375,11 +1706,6 @@ def create_mcp_router(
                 dict(prompt_arguments) if isinstance(prompt_arguments, dict) else {},
             )
             return {"messages": messages}
-
-        if method == "roots/list":
-            logger.info("Handling roots/list request")
-            roots = _roots_manager.list_roots()
-            return {"roots": [{"uri": r["uri"], "name": r.get("name")} for r in roots]}
 
         if method == "logging/setLevel":
             logger.info("Handling logging/setLevel request")
@@ -1438,17 +1764,23 @@ def create_mcp_router(
         request_id: object,
         request: Request,
         session_id_to_return: str | None,
+        method: str | None = None,
     ) -> JSONResponse | StreamingResponse:
         """Wrap result dict in JSON-RPC envelope, select transport format.
 
         SSE when Accept contains text/event-stream AND session_store is not None.
-        Adds Mcp-Session-Id header when session_id_to_return is not None.
+        Adds Mcp-Session-Id header when session_id_to_return is not None. When
+        method is a paginated list method, the SSE path streams each page item
+        as its own partial-result frame followed by an authoritative final
+        frame carrying the full page and nextCursor, instead of one single
+        event frame.
 
         Args:
             result: Result dict to wrap in JSON-RPC response envelope.
             request_id: JSON-RPC request ID for the response envelope.
             request: FastAPI Request object for reading Accept header.
             session_id_to_return: Session ID to include in response header, or None.
+            method: JSON-RPC method name, used to detect paginated list methods.
 
         Returns:
             StreamingResponse for SSE clients, JSONResponse otherwise.
@@ -1458,8 +1790,6 @@ def create_mcp_router(
         accept_header = request.headers.get("Accept", "")
         wants_sse = "text/event-stream" in accept_header
         if wants_sse and session_store is not None:
-            raw_body = response.body
-            result_body = bytes(raw_body).decode() if isinstance(raw_body, memoryview) else raw_body.decode()
             sse_headers: dict[str, str] = {"Cache-Control": "no-cache"}
             if session_id_to_return:
                 sse_headers["Mcp-Session-Id"] = session_id_to_return
@@ -1467,6 +1797,17 @@ def create_mcp_router(
                     "Including Mcp-Session-Id header in SSE response: %s",
                     session_id_to_return,
                 )
+
+            item_key = _PAGINATED_LIST_RESULT_KEYS.get(method or "")
+            if item_key is not None:
+                return StreamingResponse(
+                    _paginated_list_event_stream(result, request_id, item_key),
+                    media_type="text/event-stream",
+                    headers=sse_headers,
+                )
+
+            raw_body = response.body
+            result_body = bytes(raw_body).decode() if isinstance(raw_body, memoryview) else raw_body.decode()
 
             async def _single_event() -> AsyncGenerator[str]:
                 yield f"data: {result_body}\n\n"
@@ -1488,35 +1829,34 @@ def create_mcp_router(
 
     def _validate_protocol_version(
         protocol_version: str | None,
-        request_id: object,
-    ) -> tuple[str, JSONResponse | None]:
-        """Normalise and validate the MCP-Protocol-Version header value.
+    ) -> str:
+        """Normalise and negotiate the MCP-Protocol-Version header value.
 
-        Defaults a missing header to "2025-03-26" for backward compatibility.
+        Defaults a missing header to "2025-03-26" for backward compatibility,
+        then clamps the requested version to the highest supported version at
+        or below it via `_negotiate_protocol_version`.
 
         Args:
             protocol_version: Raw header value, or None when header is absent.
-            request_id: JSON-RPC request ID used in error response.
 
         Returns:
-            Tuple of (resolved version string, JSONResponse error or None).
-            The error is a 400 response when the version is unsupported.
+            The negotiated (possibly clamped) protocol version string.
+
+        Raises:
+            MCPError: If the requested version is below all supported versions.
         """
         logger.debug("MCP-Protocol-Version header: %s", protocol_version)
         if not protocol_version:
             logger.info("Missing MCP-Protocol-Version header, assuming 2025-03-26 for backwards compatibility")
             protocol_version = "2025-03-26"
-        if protocol_version not in ("2025-06-18", "2025-03-26"):
-            logger.warning("Unsupported protocol version: %s", protocol_version)
-            return protocol_version, JSONResponse(
-                status_code=400,
-                content={
-                    "error": (
-                        f"Unsupported protocol version: {protocol_version}. Supported versions: 2025-06-18, 2025-03-26"
-                    )
-                },
+        negotiated = _negotiate_protocol_version(protocol_version)
+        if negotiated != protocol_version:
+            logger.info(
+                "Negotiated protocol version %s clamped from requested %s",
+                negotiated,
+                protocol_version,
             )
-        return protocol_version, None
+        return negotiated
 
     @router.post("", dependencies=dependencies, response_model=None)
     async def handle_mcp_request(
@@ -1541,13 +1881,14 @@ def create_mcp_router(
 
         Returns:
             JSONResponse with JSON-RPC formatted response or error. Success
-            responses return HTTP 200 with result field. Protocol errors
-            return HTTP 200 with error field (JSON-RPC convention). Header
-            validation errors return HTTP 400 (transport level).
+            responses return HTTP 200 with result field. Protocol errors,
+            including an unclampable protocol version, return HTTP 200 with
+            error field (JSON-RPC convention).
 
         Status Codes:
-            - 200: Successful JSON-RPC response or JSON-RPC error
-            - 400: Invalid request (missing session ID when required, invalid protocol version)
+            - 200: Successful JSON-RPC response or JSON-RPC error (including
+              unsupported protocol version, -32602)
+            - 400: Invalid request (missing session ID when required)
             - 401: Authentication required or identity not found
             - 410: Session expired or not found (stateful mode)
             - 500: Internal server error (session creation failures)
@@ -1566,11 +1907,13 @@ def create_mcp_router(
             - API key connections remain stateless (no session requirement)
 
         Protocol Version Validation:
-            - MCP-Protocol-Version header REQUIRED on all requests
-            - Only "2025-06-18" is accepted (strict validation)
-            - Missing header returns HTTP 400 Bad Request
-            - Invalid version returns HTTP 400 Bad Request
-            - This enforces explicit protocol version on every request
+            - MCP-Protocol-Version header is negotiated on every request
+            - Missing header defaults to "2025-03-26" for backward compatibility
+            - The requested version is clamped to the highest version in the
+              supported whitelist ("2025-11-25", "2025-06-18", "2025-03-26")
+              that is less than or equal to the requested version
+            - A requested version below all supported versions cannot be
+              clamped and returns JSON-RPC error -32602 naming the version
 
         Error Handling:
             - MCPError: Returns JSON-RPC error response with error code
@@ -1643,11 +1986,7 @@ def create_mcp_router(
             body, method, request_id, params = parsed
 
             # 3. Protocol version
-            protocol_version, pv_err = _validate_protocol_version(
-                request.headers.get("MCP-Protocol-Version"), request_id
-            )
-            if pv_err is not None:
-                return pv_err
+            protocol_version = _validate_protocol_version(request.headers.get("MCP-Protocol-Version"))
             # 4. OTel counter
             logger.info("Processing method: %s (id: %s)", method, request_id)
             if _request_counter is not None:
@@ -1656,7 +1995,7 @@ def create_mcp_router(
 
             # 5. Session
             is_oauth_connection = _bearer_token is not None
-            session_result = await _resolve_session(method, request, is_oauth_connection, body)
+            session_result = await _resolve_session(method, request, is_oauth_connection, body, protocol_version)
             if isinstance(session_result, JSONResponse):
                 return session_result
             active_session_id, session_id_to_return = session_result
@@ -1677,7 +2016,7 @@ def create_mcp_router(
 
             # 7. Format
             logger.info("Returning successful response for method: %s", method)
-            return _format_response(dispatch_result, request_id, request, session_id_to_return)
+            return _format_response(dispatch_result, request_id, request, session_id_to_return, method)
 
         except ValueError as e:
             # ValueError should not occur here since we already parsed the body
@@ -1802,6 +2141,7 @@ class MCPRouter(APIRouter):
         self._resource_registry = ResourceRegistry()
         self._prompt_registry = PromptRegistry()
         self._shutdown_event: asyncio.Event = asyncio.Event()
+        self._session_store = session_store
 
         inner = create_mcp_router(
             registry=self._tool_registry,
@@ -1844,6 +2184,153 @@ class MCPRouter(APIRouter):
                 await mcp.shutdown()
         """
         self._shutdown_event.set()
+
+    async def notify_tools_list_changed(self) -> None:
+        """Notify all live sessions that the tool list has changed.
+
+        Enqueues a ``notifications/tools/list_changed`` message onto every
+        live session's message queue via the configured SessionStore. Each
+        call enqueues exactly one notification per session; callers control
+        call frequency. Silently does nothing if no session_store was
+        configured.
+
+        Example:
+            >>> await mcp.notify_tools_list_changed()
+        """
+        await self._broadcast_list_changed("notifications/tools/list_changed")
+
+    async def notify_resources_list_changed(self) -> None:
+        """Notify all live sessions that the resource list has changed.
+
+        Enqueues a ``notifications/resources/list_changed`` message onto
+        every live session's message queue via the configured SessionStore.
+        Silently does nothing if no session_store was configured.
+
+        Example:
+            >>> await mcp.notify_resources_list_changed()
+        """
+        await self._broadcast_list_changed("notifications/resources/list_changed")
+
+    async def notify_prompts_list_changed(self) -> None:
+        """Notify all live sessions that the prompt list has changed.
+
+        Enqueues a ``notifications/prompts/list_changed`` message onto every
+        live session's message queue via the configured SessionStore.
+        Silently does nothing if no session_store was configured.
+
+        Example:
+            >>> await mcp.notify_prompts_list_changed()
+        """
+        await self._broadcast_list_changed("notifications/prompts/list_changed")
+
+    async def notify_resource_updated(self, uri: str) -> None:
+        """Notify subscribed sessions that a resource has been updated.
+
+        Enqueues a ``notifications/resources/updated`` message, including the
+        updated ``uri`` in ``params``, onto the message queue of every session
+        subscribed to that URI. Sessions that never subscribed to ``uri``
+        receive nothing. Silently does nothing if no session_store was
+        configured.
+
+        Args:
+            uri: URI of the resource that was updated.
+
+        Raises:
+            MCPError: -32603 if the subscriber lookup itself fails (e.g. a
+                Redis-backed SessionStore is unreachable). Failures to
+                enqueue onto an individual session's queue are logged and
+                do not prevent delivery to the remaining subscribers.
+
+        Example:
+            >>> await mcp.notify_resource_updated("file:///data/report.txt")
+        """
+        if self._session_store is None:
+            return
+        notification: dict[str, object] = {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": uri},
+        }
+        session_store = self._session_store
+        subscriber_ids = await session_store.find_subscribers(uri)
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ENQUEUES)
+        await asyncio.gather(
+            *(
+                self._enqueue_with_semaphore(
+                    session_store,
+                    session_id,
+                    notification,
+                    semaphore,
+                    "Failed to enqueue resource update notification for session %s",
+                )
+                for session_id in subscriber_ids
+            )
+        )
+
+    async def _broadcast_list_changed(self, method: str) -> None:
+        """Enqueue a list_changed notification for every live session.
+
+        Args:
+            method: Fully qualified notification method name, e.g.
+                ``notifications/tools/list_changed``.
+
+        Raises:
+            MCPError: -32603 if the session lookup itself fails (e.g. a
+                Redis-backed SessionStore is unreachable). Failures to
+                enqueue onto an individual session's queue are logged and
+                do not prevent delivery to the remaining sessions.
+        """
+        if self._session_store is None:
+            return
+        notification: dict[str, object] = {"jsonrpc": "2.0", "method": method}
+        session_store = self._session_store
+        session_ids = await session_store.list_sessions()
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ENQUEUES)
+        await asyncio.gather(
+            *(
+                self._enqueue_with_semaphore(
+                    session_store,
+                    session_id,
+                    notification,
+                    semaphore,
+                    "Failed to enqueue %s notification for session %s",
+                    method,
+                )
+                for session_id in session_ids
+            )
+        )
+
+    async def _enqueue_with_semaphore(
+        self,
+        session_store: SessionStore,
+        session_id: str,
+        notification: dict[str, object],
+        semaphore: asyncio.Semaphore,
+        error_message: str,
+        *error_args: object,
+    ) -> None:
+        """Enqueue one notification onto a session's queue, bounded by a semaphore.
+
+        Runs as a fan-out task under ``asyncio.gather``. A failure on this
+        session's enqueue is logged and swallowed so it does not cancel or
+        block delivery to the other sessions running concurrently.
+
+        Args:
+            session_store: SessionStore to enqueue onto (caller has already
+                confirmed it is not None).
+            session_id: UUID4 string identifying the target session.
+            notification: JSON-RPC notification dict to enqueue.
+            semaphore: Shared semaphore bounding concurrent enqueue calls.
+            error_message: printf-style log message; must accept the trailing
+                session_id argument in addition to any error_args.
+            error_args: Extra positional arguments interpolated before
+                session_id in error_message.
+        """
+        async with semaphore:
+            try:
+                await session_store.enqueue_message(session_id, notification)
+            except Exception:
+                logger.exception(error_message, *error_args, session_id)
 
     def tool(
         self,
@@ -2077,14 +2564,15 @@ def handle_initialize(
         params: Initialize request parameters. Expected to contain
             protocolVersion field, though this implementation doesn't
             validate it (validation happens in router via header check).
-        protocol_version: Negotiated protocol version (from header or defaulted)
+        protocol_version: Negotiated protocol version, already clamped to the
+            supported whitelist by the router before this call.
         server_info: Optional custom server metadata to merge with defaults.
             Supports fields like name, version, title, description, icons,
             and websiteUrl for Claude Custom Connectors branding.
 
     Returns:
         Dictionary containing:
-        - protocolVersion: Negotiated version (2025-06-18 or 2025-03-26)
+        - protocolVersion: The negotiated version passed in (already clamped)
         - capabilities: {"tools": {}} (tool support enabled)
         - serverInfo: Merged server info with defaults for name and version
 
@@ -2108,6 +2596,14 @@ def handle_initialize(
         >>> result["serverInfo"]["title"]
         'My Server'
     """
+    server_info_icons = (server_info or {}).get("icons")
+    if server_info_icons:
+        for icon in server_info_icons:
+            try:
+                Icon.model_validate(icon)
+            except ValidationError as e:
+                raise MCPError(code=-32602, message=f"Invalid server_info icon: {e}") from e
+
     default_info: dict[str, object] = {"name": "fastapi-mcp-router", "version": "0.1.0"}
     return {
         "protocolVersion": protocol_version,
@@ -2118,26 +2614,79 @@ def handle_initialize(
     }
 
 
+async def _paginated_list_event_stream(
+    result: dict,
+    request_id: object,
+    item_key: str,
+) -> AsyncGenerator[str]:
+    """Stream a paginated list result as per-item SSE partial results.
+
+    Reuses the ``id: N\\nevent: message\\ndata: ...\\n\\n`` framing used by the
+    resumable event stream. Each item in the already-paginated page is
+    emitted as its own partial JSON-RPC result frame; the final frame is
+    authoritative and carries the full page plus nextCursor (when present),
+    matching the non-SSE JSONResponse contract exactly.
+
+    Args:
+        result: Already-paginated result dict, e.g. {"tools": [...],
+            "nextCursor": "..."}.
+        request_id: JSON-RPC request ID for the response envelope.
+        item_key: Key in result holding the page's list of items.
+
+    Yields:
+        SSE-formatted strings, one per item plus one final authoritative frame.
+    """
+    items = cast(list, result.get(item_key, []))
+    event_id = 0
+    for item in items:
+        event_id += 1
+        partial_payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {item_key: [item]},
+        }
+        yield f"id: {event_id}\nevent: message\ndata: {json.dumps(partial_payload)}\n\n"
+
+    event_id += 1
+    final_payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
+    yield f"id: {event_id}\nevent: message\ndata: {json.dumps(final_payload)}\n\n"
+
+
 def handle_tools_list(
     registry: MCPToolRegistry,
     excluded_tools: list[str] | None = None,
+    cursor: str | None = None,
+    page_size: int = _DEFAULT_PAGE_SIZE,
+    protocol_version: str | None = None,
 ) -> dict[str, object]:
     """
     Handle tools/list request.
 
     Retrieves all registered tools from the registry and returns them in
     MCP format. Each tool includes name, description, and JSON schema for
-    input validation. Optionally filters out tools by name.
+    input validation. Optionally filters out tools by name, then paginates
+    the remaining tools.
 
     Args:
         registry: Tool registry containing registered MCP tools
         excluded_tools: Optional list of tool names to exclude from the response.
             If None or empty, all tools are returned.
+        cursor: Opaque pagination cursor from a previous page, or None for
+            the first page.
+        page_size: Maximum number of tools to return in this page.
+        protocol_version: Negotiated MCP protocol version string. Controls
+            whether icons are emitted on each tool (requires "2025-11-25" or
+            later). Defaults to None, which omits icons.
 
     Returns:
         Dictionary containing:
-        - tools: List of tool definitions, each with name, description, and
+        - tools: Page of tool definitions, each with name, description, and
           inputSchema fields
+        - nextCursor: Opaque cursor for the next page. Omitted when this is
+          the final page.
+
+    Raises:
+        MCPError: If cursor is malformed or cannot be decoded.
 
     Example:
         >>> registry = MCPToolRegistry()
@@ -2159,10 +2708,14 @@ def handle_tools_list(
         >>> len(result["tools"])
         0
     """
-    tools = registry.list_tools()
+    tools = registry.list_tools(protocol_version=protocol_version)
     if excluded_tools:
         tools = [t for t in tools if t["name"] not in excluded_tools]
-    return {"tools": tools}
+    page, next_cursor = _paginate_or_raise(tools, cursor, page_size=page_size)
+    result: dict[str, object] = {"tools": page}
+    if next_cursor is not None:
+        result["nextCursor"] = next_cursor
+    return result
 
 
 async def handle_tools_call(
@@ -2174,6 +2727,7 @@ async def handle_tools_call(
     session_id: str | None = None,
     progress_callback: object | None = None,
     sampling_manager: object | None = None,
+    negotiated_version: str = _SUPPORTED_PROTOCOL_VERSIONS[-1],
 ) -> dict[str, object]:
     """
     Handle tools/call request.
@@ -2184,8 +2738,8 @@ async def handle_tools_call(
     For stateful mode with a generator tool (is_generator=True) and an active
     session_store + session_id: the registry returns the raw AsyncGenerator.
     The router collects all yielded dicts synchronously and returns them as a
-    list in the POST response body (IR-3). If the generator raises mid-iteration
-    the response contains isError: true with the error message (EC-4).
+    list in the POST response body. If the generator raises mid-iteration
+    the response contains isError: true with the error message.
 
     For stateless mode or non-generator tools, behaviour is unchanged.
 
@@ -2202,17 +2756,22 @@ async def handle_tools_call(
         background_tasks: FastAPI BackgroundTasks for async task scheduling
         session_store: Optional SessionStore for stateful mode detection.
             When provided with session_id, generator results are collected
-            synchronously and returned in the POST response (IR-3).
+            synchronously and returned in the POST response.
         session_id: Active session ID. Required when session_store is provided
             and tool is a generator.
         progress_callback: Optional ProgressCallback injected into tools that
             declare a ``progress: ProgressCallback`` parameter. In stateful mode
             this reports progress notifications via the session SSE stream and
-            raises asyncio.CancelledError when the request is cancelled (AC-42).
-            Pass None in stateless mode; the registry injects a no-op (AC-43).
+            raises asyncio.CancelledError when the request is cancelled.
+            Pass None in stateless mode; the registry injects a no-op.
         sampling_manager: Optional SamplingManager injected into tools that
             declare a ``sampling_manager: SamplingManager`` parameter. Enables
-            server-to-client LLM sampling requests (AC-52, AC-53).
+            server-to-client LLM sampling requests.
+        negotiated_version: The protocol version negotiated for this
+            connection, used to gate image/audio/resource_link content
+            blocks when a tool returns content-block model instances.
+            Defaults to the oldest supported version (most restrictive
+            gating) when not explicitly provided.
 
     Returns:
         Dictionary containing:
@@ -2226,7 +2785,7 @@ async def handle_tools_call(
             ]
         }
 
-        Stateful generator collected structure (IR-3):
+        Stateful generator collected structure:
         {
             "content": [<dict>, ...]
         }
@@ -2304,13 +2863,13 @@ async def handle_tools_call(
             sampling_manager=sampling_manager,
         )
 
-        # IR-3: stateful generator — collect all yielded items into a list for the POST response
+        # Stateful generator — collect all yielded items into a list for the POST response
         if use_stateful_streaming and hasattr(result, "__aiter__"):
             gen_result = cast(AsyncGenerator[dict], result)
             try:
                 collected = await registry._collect_generator(gen_result)
             except ToolError as gen_err:
-                # EC-4: generator raised mid-iteration — return isError response
+                # Generator raised mid-iteration — return isError response
                 return {
                     "content": [{"type": "text", "text": gen_err.message}],
                     "isError": True,
@@ -2321,6 +2880,15 @@ async def handle_tools_call(
         if isinstance(result, dict) and "structuredContent" in result:
             wire: dict[str, object] = {str(k): v for k, v in result.items()}
             return wire  # Already in correct MCP wire format with structuredContent + content
+
+        # Tool returned one or more content-block model instances directly
+        # (e.g. ImageContent, mixed TextContent + ImageContent) — build each
+        # block through the shared builder so gated types honor the
+        # negotiated version.
+        content_blocks = _as_content_blocks(result)
+        if content_blocks is not None:
+            built = (build_content_block(block, negotiated_version) for block in content_blocks)
+            return {"content": [b for b in built if b is not None]}
 
         # Wrap successful result in MCP format
         # Convert dict/list results to JSON string, keep strings as-is

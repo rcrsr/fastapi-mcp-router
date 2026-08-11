@@ -1,6 +1,5 @@
 """Tests for PromptRegistry and prompts MCP protocol methods.
 
-Covers AC-29 through AC-83, EC-5 through EC-8, and IC-18:
 - @prompt() decorator registers handler with auto-generated arguments
 - prompts/list returns name, description, arguments
 - prompts/get calls handler with validated args and returns messages
@@ -557,3 +556,111 @@ async def test_prompts_list_returns_32601_when_registry_is_empty() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["error"]["code"] == -32601
+
+
+# ---------------------------------------------------------------------------
+# Icons: version-gated emission on prompts/list
+# ---------------------------------------------------------------------------
+
+
+def _register_prompt_with_icon(registry: PromptRegistry) -> None:
+    @registry.prompt(icons=[{"src": "https://example.com/icon.png"}])
+    async def icon_prompt(topic: str) -> list[dict]:
+        """Prompt with an icon."""
+        return [{"role": "user", "content": topic}]
+
+
+@pytest.mark.unit
+def test_list_prompts_emits_icons_when_negotiated_version_supports_them() -> None:
+    """Icons appear in prompts/list when negotiated version is 2025-11-25."""
+    registry = PromptRegistry()
+    _register_prompt_with_icon(registry)
+
+    prompts = registry.list_prompts(protocol_version="2025-11-25")
+
+    assert prompts[0]["icons"] == [{"src": "https://example.com/icon.png"}]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("protocol_version", [None, "2025-06-18", "2025-03-26"])
+def test_list_prompts_omits_icons_below_negotiated_version(protocol_version: str | None) -> None:
+    """Icons are omitted from prompts/list when negotiated version is below 2025-11-25."""
+    registry = PromptRegistry()
+    _register_prompt_with_icon(registry)
+
+    prompts = registry.list_prompts(protocol_version=protocol_version)
+
+    assert "icons" not in prompts[0]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prompts_list_endpoint_emits_icons_when_negotiated_version_supports_them() -> None:
+    """prompts/list over HTTP emits icons at negotiated version 2025-11-25."""
+    registry = PromptRegistry()
+    _register_prompt_with_icon(registry)
+
+    app = build_app_with_prompts(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {**MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=make_jsonrpc("prompts/list"), headers=headers)
+
+    body = resp.json()
+    assert body["result"]["prompts"][0]["icons"] == [{"src": "https://example.com/icon.png"}]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prompts_list_endpoint_omits_icons_below_negotiated_version() -> None:
+    """prompts/list over HTTP omits icons when negotiated version is below 2025-11-25."""
+    registry = PromptRegistry()
+    _register_prompt_with_icon(registry)
+
+    app = build_app_with_prompts(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=make_jsonrpc("prompts/list"), headers=MCP_HEADERS)
+
+    body = resp.json()
+    assert "icons" not in body["result"]["prompts"][0]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prompts_list_endpoint_omits_icons_when_no_protocol_version_header_sent() -> None:
+    """prompts/list over HTTP omits icons when the MCP-Protocol-Version header is absent entirely.
+
+    Distinct from test_prompts_list_endpoint_omits_icons_below_negotiated_version,
+    which always sends an explicit (pre-2025-11-25) header value; this
+    exercises the default-negotiation path used when a client sends no
+    header at all.
+    """
+    registry = PromptRegistry()
+    _register_prompt_with_icon(registry)
+
+    app = build_app_with_prompts(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {k: v for k, v in MCP_HEADERS.items() if k != "MCP-Protocol-Version"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=make_jsonrpc("prompts/list"), headers=headers)
+
+    body = resp.json()
+    assert "icons" not in body["result"]["prompts"][0]
+
+
+@pytest.mark.unit
+def test_prompt_icon_with_disallowed_scheme_rejected_at_registration() -> None:
+    """@registry.prompt(icons=...) rejects a non-HTTPS/data: icon src fail-fast.
+
+    Proves Icon.model_validate() actually runs on the prompt-icon surface,
+    not just on tool icons.
+    """
+    registry = PromptRegistry()
+
+    with pytest.raises(Exception, match="not allowed"):
+
+        @registry.prompt(icons=[{"src": "http://example.com/icon.png"}])
+        async def bad_icon_prompt(topic: str) -> list[dict]:
+            """Prompt with a disallowed icon scheme."""
+            return [{"role": "user", "content": topic}]

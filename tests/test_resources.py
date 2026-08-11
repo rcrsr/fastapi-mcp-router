@@ -1,7 +1,4 @@
-"""Tests for ResourceRegistry, FileResourceProvider, and resource HTTP endpoints.
-
-Covers AC-22 through AC-94, EC-1 through EC-4, IC-17, AC-5, and AC-6.
-"""
+"""Tests for ResourceRegistry, FileResourceProvider, and resource HTTP endpoints."""
 
 import inspect
 
@@ -11,7 +8,15 @@ from fastapi import Depends, FastAPI
 
 from fastapi_mcp_router import MCPToolRegistry, ResourceRegistry, create_mcp_router
 from fastapi_mcp_router.exceptions import MCPError
-from fastapi_mcp_router.resources import FileResourceProvider, ResourceContents, ResourceProvider
+from fastapi_mcp_router.resources import (
+    FileResourceProvider,
+    Resource,
+    ResourceContents,
+    ResourceProvider,
+    ResourceTemplate,
+)
+from fastapi_mcp_router.router import _shape_resource, _shape_resource_template
+from fastapi_mcp_router.types import Icon
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -132,6 +137,33 @@ async def test_resources_list_returns_correct_structure() -> None:
     assert r["name"] == "Note"
     assert r["description"] == "A user note"
     assert r["mimeType"] == "text/plain"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_list_omits_mime_type_when_unset() -> None:
+    """A resource registered without mime_type omits the mimeType key on the wire."""
+    registry = ResourceRegistry()
+
+    @registry.resource(
+        "notes://{id}",
+        name="Note",
+        description="A user note",
+    )
+    async def get_note(id: str) -> str:
+        """Return note text."""
+        return f"note:{id}"
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/list"), headers=_MCP_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    resources = body["result"]["resources"]
+    assert len(resources) == 1
+    assert "mimeType" not in resources[0]
 
 
 # ---------------------------------------------------------------------------
@@ -769,3 +801,311 @@ async def test_resource_depends_exception_returns_error_via_http() -> None:
     body = resp.json()
     assert "error" in body
     assert body["error"]["code"] == -32603
+
+
+# ---------------------------------------------------------------------------
+# resources/templates/list dispatch branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_templates_list_returns_correct_structure() -> None:
+    """With registered templates, resources/templates/list returns resourceTemplates."""
+    registry = ResourceRegistry()
+
+    @registry.resource(
+        "notes://{id}",
+        name="Note",
+        description="A user note",
+        mime_type="text/plain",
+    )
+    async def get_note(id: str) -> str:
+        """Return note text."""
+        return f"note:{id}"
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=_MCP_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "result" in body
+    templates = body["result"]["resourceTemplates"]
+    assert len(templates) == 1
+    t = templates[0]
+    assert t["uriTemplate"] == "notes://{id}"
+    assert t["name"] == "Note"
+    assert t["description"] == "A user note"
+    assert t["mimeType"] == "text/plain"
+    assert "nextCursor" not in body["result"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_templates_list_returns_32601_when_no_registry() -> None:
+    """No resource registry configured returns -32601 naming resources/templates/list."""
+    app = _make_app_without_resource_registry()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=_MCP_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "error" in body
+    assert body["error"]["code"] == -32601
+    assert "resources/templates/list" in body["error"]["message"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_templates_list_paginates_beyond_default_page_size() -> None:
+    """More than 100 templates paginate per the shared list-method default."""
+    registry = ResourceRegistry()
+
+    def _register(index: int) -> None:
+        @registry.resource(f"item://{index:03d}", name=f"item_{index:03d}")
+        async def handler() -> str:
+            """Test resource handler."""
+            return "content"
+
+    for i in range(105):
+        _register(i)
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=_MCP_HEADERS)
+        first_result = first.json()["result"]
+        assert len(first_result["resourceTemplates"]) == 100
+        next_cursor = first_result["nextCursor"]
+
+        second = await client.post(
+            "/mcp",
+            json=_rpc("resources/templates/list", {"cursor": next_cursor}),
+            headers=_MCP_HEADERS,
+        )
+        second_result = second.json()["result"]
+        assert len(second_result["resourceTemplates"]) == 5
+        assert "nextCursor" not in second_result
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_templates_list_omits_mime_type_when_unset() -> None:
+    """A template registered without mime_type omits mimeType instead of emitting null."""
+    registry = ResourceRegistry()
+
+    @registry.resource("plain://{id}", name="Plain", description="No mime type")
+    async def get_plain(id: str) -> str:
+        """Return plain content."""
+        return f"plain:{id}"
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        templates_resp = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=_MCP_HEADERS)
+        resources_resp = await client.post("/mcp", json=_rpc("resources/list"), headers=_MCP_HEADERS)
+
+    templates_template = templates_resp.json()["result"]["resourceTemplates"][0]
+    resources_template = resources_resp.json()["result"]["resourceTemplates"][0]
+
+    assert "mimeType" not in templates_template
+    assert "mimeType" not in resources_template
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_list_and_templates_list_emit_identical_template_shape() -> None:
+    """resources/list's inline bundle and resources/templates/list share one shaper."""
+    registry = ResourceRegistry()
+
+    @registry.resource(
+        "notes://{id}",
+        name="Note",
+        description="A user note",
+        mime_type="text/plain",
+    )
+    async def get_note(id: str) -> str:
+        """Return note text."""
+        return f"note:{id}"
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        templates_resp = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=_MCP_HEADERS)
+        resources_resp = await client.post("/mcp", json=_rpc("resources/list"), headers=_MCP_HEADERS)
+
+    templates_shape = templates_resp.json()["result"]["resourceTemplates"][0]
+    resources_shape = resources_resp.json()["result"]["resourceTemplates"][0]
+    assert templates_shape == resources_shape
+
+
+# ---------------------------------------------------------------------------
+# Icons: version-gated emission on resources/list and resources/templates/list
+# ---------------------------------------------------------------------------
+
+
+def _register_resource_with_icon(registry: ResourceRegistry) -> None:
+    @registry.resource(
+        "icon://{id}",
+        name="IconResource",
+        description="A resource with an icon",
+        icons=[{"src": "https://example.com/icon.png"}],
+    )
+    async def get_icon_resource(id: str) -> str:
+        """Return content for an icon-bearing resource."""
+        return f"content:{id}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_list_emits_icons_when_negotiated_version_supports_them() -> None:
+    """Icons appear in resources/list (both resources and resourceTemplates) at 2025-11-25."""
+    registry = ResourceRegistry()
+    _register_resource_with_icon(registry)
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {**_MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/list"), headers=headers)
+
+    result = resp.json()["result"]
+    assert result["resources"][0]["icons"] == [{"src": "https://example.com/icon.png"}]
+    assert result["resourceTemplates"][0]["icons"] == [{"src": "https://example.com/icon.png"}]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", ["2025-06-18", "2025-03-26"])
+async def test_resources_list_omits_icons_below_negotiated_version(protocol_version: str) -> None:
+    """Icons are omitted from resources/list when negotiated version is below 2025-11-25."""
+    registry = ResourceRegistry()
+    _register_resource_with_icon(registry)
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {**_MCP_HEADERS, "MCP-Protocol-Version": protocol_version}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/list"), headers=headers)
+
+    result = resp.json()["result"]
+    assert "icons" not in result["resources"][0]
+    assert "icons" not in result["resourceTemplates"][0]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_templates_list_emits_icons_when_negotiated_version_supports_them() -> None:
+    """Icons appear in resources/templates/list at 2025-11-25."""
+    registry = ResourceRegistry()
+    _register_resource_with_icon(registry)
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {**_MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=headers)
+
+    result = resp.json()["result"]
+    assert result["resourceTemplates"][0]["icons"] == [{"src": "https://example.com/icon.png"}]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol_version", ["2025-06-18", "2025-03-26"])
+async def test_resources_templates_list_omits_icons_below_negotiated_version(protocol_version: str) -> None:
+    """Icons are omitted from resources/templates/list when negotiated version is below 2025-11-25."""
+    registry = ResourceRegistry()
+    _register_resource_with_icon(registry)
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {**_MCP_HEADERS, "MCP-Protocol-Version": protocol_version}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/templates/list"), headers=headers)
+
+    result = resp.json()["result"]
+    assert "icons" not in result["resourceTemplates"][0]
+
+
+@pytest.mark.unit
+def test_shape_resource_omits_icons_when_protocol_version_is_none() -> None:
+    """_shape_resource() omits icons when called with the default protocol_version=None.
+
+    Mirrors MCPToolRegistry.list_tools(protocol_version=None) unit-level
+    coverage for tools/list: exercises the gating helper directly rather
+    than only through the HTTP layer.
+    """
+    resource = Resource(
+        uri="icon://direct",
+        name="IconResource",
+        description="A resource with an icon",
+        icons=[Icon(src="https://example.com/icon.png")],
+    )
+
+    shaped = _shape_resource(resource)
+
+    assert "icons" not in shaped
+
+
+@pytest.mark.unit
+def test_shape_resource_template_omits_icons_when_protocol_version_is_none() -> None:
+    """_shape_resource_template() omits icons when called with the default protocol_version=None."""
+    template = ResourceTemplate(
+        uri_template="icon://{id}",
+        name="IconResource",
+        description="A resource template with an icon",
+        icons=[Icon(src="https://example.com/icon.png")],
+    )
+
+    shaped = _shape_resource_template(template)
+
+    assert "icons" not in shaped
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resources_list_omits_icons_when_no_protocol_version_header_sent() -> None:
+    """resources/list omits icons when the MCP-Protocol-Version header is absent entirely.
+
+    Distinct from test_resources_list_omits_icons_below_negotiated_version,
+    which always sends an explicit (pre-2025-11-25) header value; this
+    exercises the default-negotiation path used when a client sends no
+    header at all.
+    """
+    registry = ResourceRegistry()
+    _register_resource_with_icon(registry)
+
+    app = _make_app_with_resource_registry(registry)
+    transport = httpx.ASGITransport(app=app)
+    headers = {k: v for k, v in _MCP_HEADERS.items() if k != "MCP-Protocol-Version"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/mcp", json=_rpc("resources/list"), headers=headers)
+
+    result = resp.json()["result"]
+    assert "icons" not in result["resources"][0]
+    assert "icons" not in result["resourceTemplates"][0]
+
+
+@pytest.mark.unit
+def test_resource_icon_with_disallowed_scheme_rejected_at_registration() -> None:
+    """@registry.resource(icons=...) rejects a non-HTTPS/data: icon src fail-fast.
+
+    Proves Icon.model_validate() actually runs on the resource-icon surface,
+    not just on tool icons.
+    """
+    registry = ResourceRegistry()
+
+    with pytest.raises(Exception, match="not allowed"):
+
+        @registry.resource(
+            "bad-icon://{id}",
+            name="BadIconResource",
+            icons=[{"src": "http://example.com/icon.png"}],
+        )
+        async def get_bad_icon_resource(id: str) -> str:
+            """Resource with a disallowed icon scheme."""
+            return f"content:{id}"

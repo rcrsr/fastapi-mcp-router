@@ -52,7 +52,12 @@ That's it. Your FastAPI app now speaks MCP over Streamable HTTP.
 
 ## What You Get
 
-- **Full MCP 2025-06-18 spec** — tools, resources, prompts, sampling, logging, completions, elicitation
+- **MCP `2025-11-25` (primary), with `2025-06-18` and `2025-03-26` as accepted fallbacks** — tools, resources, prompts, sampling, logging, completions, elicitation. The router negotiates protocol version per request: it clamps the client's requested version down to the highest version in that three-way whitelist that is `<=` requested, rather than echoing an unrecognized version back.
+- **Pagination** — `tools/list`, `resources/list`, `resources/templates/list`, and `prompts/list` accept an opaque `cursor` and return `nextCursor` when more items remain.
+- **`resources/templates/list`** — resource templates are discoverable as their own paginated method, not only nested inside `resources/list`.
+- **Notifications** — `MCPRouter.notify_tools_list_changed()`, `notify_resources_list_changed()`, `notify_prompts_list_changed()`, and `notify_resource_updated(uri)` push list-changed and resource-update notifications to live sessions (stateful mode).
+- **Content blocks** — tools can return `ImageContent`, `AudioContent`, and `ResourceLinkContent` alongside `TextContent`; blocks are gated to connections negotiating `2025-11-25` or later.
+- **Icons** — attach `Icon` (validated, HTTPS/`data:` only, SVG-script-scanned) to tools via `title`/`icons` params on `MCPToolRegistry.tool()`, and server-wide via `ServerIcon` on `ServerInfo`.
 - **Streamable HTTP** — JSON or SSE response based on `Accept` header
 - **Streaming tools** — return `AsyncGenerator` for incremental results
 - **Session management** — in-memory and Redis stores for stateful connections
@@ -60,6 +65,18 @@ That's it. Your FastAPI app now speaks MCP over Streamable HTTP.
 - **Auth** — `auth_validator` callback + OAuth 2.1 PRM (RFC 9728)
 - **OpenTelemetry** — opt-in spans and counters via `pip install fastapi-mcp-router[otel]`
 - **Lambda-ready** — stateless mode works with Mangum, no adapter overhead
+
+## Breaking Change in 0.4.0: Roots Removed
+
+The MCP spec defines Roots as a **client→server** capability (the client tells the server which directories/URIs it may operate within); previous versions of this library inverted that relationship by having the server host its own root list, which was non-conformant. Roots is also deprecated outright going forward in the spec.
+
+As of 0.4.0:
+
+- The `roots_manager` constructor parameter of `create_mcp_router()` has been removed. If you passed `roots_manager=...`, remove it — there is no replacement parameter.
+- The `roots/list` JSON-RPC method now returns `-32601` (`Method not found`) for any caller.
+- `Root` and `RootsManager` were never part of the public API (`fastapi_mcp_router.__all__`), so no import statement needs to change — only the `roots_manager` constructor argument and any direct calls to `roots/list` are affected.
+
+If your application relied on server-hosted roots, there is no drop-in replacement in this library; implement root-boundary enforcement in your own tool handlers instead.
 
 ## Documentation
 

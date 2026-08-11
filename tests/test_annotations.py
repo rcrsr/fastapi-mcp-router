@@ -187,3 +187,39 @@ def test_annotations_do_not_affect_tool_execution(client: TestClient):
     result_data = json.loads(result_text)
     assert result_data["id"] == "test-123"
     assert result_data["name"] == "Example"
+
+
+@pytest.mark.integration
+def test_tool_annotations_model_dump_used_as_annotations_argument():
+    """Integration: a ToolAnnotations instance's model_dump feeds tool(annotations=...) over HTTP.
+
+    Exercises the intended usage path for the typed ToolAnnotations model: build one,
+    dump it to a dict, and confirm the resulting tools/list wire shape matches what raw
+    dict-based annotations already produce (see test_tool_with_annotations_includes_annotations_field).
+    """
+    from fastapi_mcp_router import ToolAnnotations
+
+    registry = MCPToolRegistry()
+
+    hints = ToolAnnotations(readOnlyHint=True, title="Typed Tool")
+
+    @registry.tool(annotations=hints.model_dump(exclude_none=True))
+    async def typed_annotations_tool(value: str) -> str:
+        """Tool annotated via the typed ToolAnnotations model."""
+        return value
+
+    app = FastAPI()
+    app.include_router(create_mcp_router(registry), prefix="/mcp")
+    client = TestClient(app)
+
+    request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+    response = client.post(
+        "/mcp",
+        json=request,
+        headers={"MCP-Protocol-Version": "2025-06-18", "X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    tools = response.json()["result"]["tools"]
+    tool = next(t for t in tools if t["name"] == "typed_annotations_tool")
+    assert tool["annotations"] == {"readOnlyHint": True, "title": "Typed Tool"}
