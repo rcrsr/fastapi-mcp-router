@@ -8,8 +8,7 @@ server-to-client notifications. The InMemorySessionStore suits single-instance
 deployments; multi-instance deployments must provide a custom SessionStore.
 
 Also provides SamplingManager for server-to-client LLM sampling requests,
-RootsManager for tracking server operation boundaries, and MCPLoggingHandler
-for sending log messages to connected clients.
+and MCPLoggingHandler for sending log messages to connected clients.
 
 Example::
 
@@ -28,7 +27,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
@@ -61,12 +60,15 @@ class _AsyncRedisClient(Protocol):
     def lpush(self, name: str, *values: str) -> Awaitable[object]: ...
     def lrange(self, name: str, start: int, end: int) -> Awaitable[list[str | bytes]]: ...
     def pipeline(self) -> _AsyncRedisPipeline: ...
+    def scan_iter(self, match: str | None = None) -> AsyncIterator[str | bytes]: ...
+    def mget(self, keys: list[str]) -> Awaitable[list[str | bytes | None]]: ...
 
 
 logger = logging.getLogger(__name__)
 
 _QUEUE_MAX = 1000
 _SUBSCRIPTIONS_MAX = 100
+_SCAN_MGET_CHUNK_SIZE = 500
 
 
 @dataclass
@@ -183,6 +185,27 @@ class SessionStore(ABC):
 
         Returns:
             List of queued message dicts; empty list if none queued or session absent.
+        """
+        ...
+
+    @abstractmethod
+    async def list_sessions(self) -> list[str]:
+        """Return the ids of all live (non-expired) sessions.
+
+        Returns:
+            List of session_id strings for sessions currently present and unexpired.
+        """
+        ...
+
+    @abstractmethod
+    async def find_subscribers(self, uri: str) -> list[str]:
+        """Return the ids of sessions subscribed to the given resource URI.
+
+        Args:
+            uri: Resource URI to search subscriptions for.
+
+        Returns:
+            List of session_id strings whose subscriptions set contains uri.
         """
         ...
 
@@ -318,6 +341,41 @@ class InMemorySessionStore(SessionStore):
             messages = session.message_queue
             session.message_queue = []
             return messages
+
+    async def list_sessions(self) -> list[str]:
+        """Return the ids of all live (non-expired) sessions.
+
+        Expiration is judged against the current time without mutating or
+        removing expired entries; expired sessions are naturally cleaned up
+        on their next get() call.
+
+        Returns:
+            List of session_id strings for sessions currently present and unexpired.
+        """
+        async with self._lock:
+            now = datetime.now(UTC)
+            return [
+                session_id
+                for session_id, session in self._sessions.items()
+                if now - session.last_activity <= timedelta(seconds=self.ttl_seconds)
+            ]
+
+    async def find_subscribers(self, uri: str) -> list[str]:
+        """Return the ids of live sessions subscribed to the given resource URI.
+
+        Args:
+            uri: Resource URI to search subscriptions for.
+
+        Returns:
+            List of session_id strings whose subscriptions set contains uri.
+        """
+        async with self._lock:
+            now = datetime.now(UTC)
+            return [
+                session_id
+                for session_id, session in self._sessions.items()
+                if now - session.last_activity <= timedelta(seconds=self.ttl_seconds) and uri in session.subscriptions
+            ]
 
 
 class RedisSessionStore(SessionStore):
@@ -552,6 +610,90 @@ class RedisSessionStore(SessionStore):
                 raise MCPError(code=-32603, message=f"Redis error dequeuing messages: {e}") from e
         return []  # unreachable but satisfies type checker
 
+    async def _scan_key_chunks(self, prefix: str) -> AsyncIterator[list[str]]:
+        """Yield session keys matching prefix in fixed-size chunks.
+
+        Batches the non-blocking SCAN cursor into chunks of at most
+        ``_SCAN_MGET_CHUNK_SIZE`` keys so callers can process (and, for
+        ``find_subscribers``, MGET) the keyspace incrementally instead of
+        buffering every matched key/value in memory at once. Peak memory is
+        bounded by chunk size rather than by the number of live sessions.
+
+        Args:
+            prefix: Key prefix to match, e.g. ``self._session_key("")``.
+
+        Yields:
+            Lists of decoded key strings, each with at most
+            ``_SCAN_MGET_CHUNK_SIZE`` entries.
+        """
+        chunk: list[str] = []
+        async for key in self._redis.scan_iter(match=f"{prefix}*"):  # type: ignore[attr-defined]
+            chunk.append(key if isinstance(key, str) else key.decode())
+            if len(chunk) >= _SCAN_MGET_CHUNK_SIZE:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
+    async def list_sessions(self) -> list[str]:
+        """Return the ids of all live session keys in Redis.
+
+        Enumerates keys via non-blocking SCAN (not KEYS) over the
+        ``mcp:session:*`` namespace, processed in fixed-size chunks so peak
+        memory during enumeration is bounded rather than growing with the
+        SCAN cursor. Only unexpired keys exist in Redis (TTL-based
+        expiration removes them automatically), so every matched key
+        represents a live session.
+
+        Returns:
+            List of session_id strings for sessions currently present in Redis.
+
+        Raises:
+            MCPError: -32603 if the Redis operation fails.
+        """
+        prefix = self._session_key("")
+        try:
+            session_ids: list[str] = []
+            async for chunk in self._scan_key_chunks(prefix):
+                session_ids.extend(key[len(prefix) :] for key in chunk)
+            return session_ids
+        except Exception as e:
+            raise MCPError(code=-32603, message=f"Redis error listing sessions: {e}") from e
+
+    async def find_subscribers(self, uri: str) -> list[str]:
+        """Return the ids of live sessions subscribed to the given resource URI.
+
+        Scans session keys in fixed-size chunks, issuing one batched
+        ``MGET`` per chunk (rather than one ``GET`` per key, or a single
+        ``MGET`` across the entire keyspace) and filtering by subscription
+        incrementally. Peak memory is bounded by chunk size rather than by
+        the number of live sessions. A key that expires between its SCAN and
+        MGET yields ``None`` for that slot and is skipped.
+
+        Args:
+            uri: Resource URI to search subscriptions for.
+
+        Returns:
+            List of session_id strings whose subscriptions set contains uri.
+
+        Raises:
+            MCPError: -32603 if the Redis operation fails.
+        """
+        prefix = self._session_key("")
+        try:
+            subscriber_ids: list[str] = []
+            async for chunk in self._scan_key_chunks(prefix):
+                raw_values = await self._redis.mget(chunk)
+                for raw in raw_values:
+                    if raw is None:
+                        continue
+                    session = self._deserialize(raw if isinstance(raw, str) else raw.decode())
+                    if uri in session.subscriptions:
+                        subscriber_ids.append(session.session_id)
+            return subscriber_ids
+        except Exception as e:
+            raise MCPError(code=-32603, message=f"Redis error finding subscribers: {e}") from e
+
 
 class ProgressTracker:
     """Progress and cancellation management for in-flight tool requests.
@@ -705,9 +847,9 @@ class SamplingManager:
 
         Args:
             session_store: SessionStore instance for enqueueing requests. Must
-                not be None when sampling is used (EC-19).
+                not be None when sampling is used.
             sampling_enabled: Whether sampling is permitted. Must be True when
-                create_message is called (EC-20).
+                create_message is called.
 
         Raises:
             MCPError: -32601 if session_store is None (stateful mode required).
@@ -749,8 +891,8 @@ class SamplingManager:
             SamplingResponse dict with model, role, content, and stop_reason fields.
 
         Raises:
-            MCPError: -32601 if sampling_enabled is False (EC-20).
-            MCPError: -32603 if the client does not respond within 60 seconds (EC-21).
+            MCPError: -32601 if sampling_enabled is False.
+            MCPError: -32603 if the client does not respond within 60 seconds.
         """
         if not self._sampling_enabled:
             raise MCPError(
@@ -802,51 +944,6 @@ class SamplingManager:
             future.set_result(response)
 
 
-class RootsManager:
-    """Server operation boundary definitions.
-
-    Maintains a list of Root entries that define the URIs the server operates
-    on. Roots are registered via add_root and retrieved via list_roots.
-
-    Attributes:
-        _roots: Internal list of Root dicts representing registered boundaries.
-
-    Example::
-
-        manager = RootsManager()
-        manager.add_root(uri="file:///workspace", name="Workspace")
-        roots = manager.list_roots()
-        assert roots[0]["uri"] == "file:///workspace"
-    """
-
-    def __init__(self) -> None:
-        """Initialize with an empty roots list."""
-        self._roots: list[dict] = []
-
-    def add_root(self, uri: str, name: str | None = None) -> None:
-        """Register a new operation boundary by URI.
-
-        Args:
-            uri: URI string identifying the root boundary.
-            name: Optional human-readable name for the root.
-
-        Returns:
-            None
-        """
-        root: dict[str, object] = {"uri": uri}
-        if name is not None:
-            root["name"] = name
-        self._roots.append(root)
-
-    def list_roots(self) -> list[dict]:
-        """Return a copy of all registered roots.
-
-        Returns:
-            List of root dicts, each containing uri and optional name.
-        """
-        return list(self._roots)
-
-
 class MCPLoggingHandler:
     """MCP logging protocol handler for sending log messages to connected clients.
 
@@ -875,7 +972,7 @@ class MCPLoggingHandler:
 
         Args:
             session_store: SessionStore instance for enqueueing log notifications.
-                Must not be None (EC-23).
+                Must not be None.
 
         Raises:
             MCPError: -32601 if session_store is None (stateful mode required).
@@ -898,7 +995,7 @@ class MCPLoggingHandler:
             Normalised (lowercase) log level string.
 
         Raises:
-            MCPError: -32602 if level is not a recognised log level string (EC-22).
+            MCPError: -32602 if level is not a recognised log level string.
         """
         normalised = level.lower() if isinstance(level, str) else str(level).lower()
         if normalised not in _LOG_LEVEL_PRIORITY:
@@ -921,7 +1018,7 @@ class MCPLoggingHandler:
             None
 
         Raises:
-            MCPError: -32602 if level is not a recognised log level string (EC-22).
+            MCPError: -32602 if level is not a recognised log level string.
         """
         normalised = self._validate_log_level(level)
         self._levels[session_id] = normalised
@@ -949,7 +1046,7 @@ class MCPLoggingHandler:
             None
 
         Raises:
-            MCPError: -32602 if level is not a recognised log level string (EC-22).
+            MCPError: -32602 if level is not a recognised log level string.
         """
         normalised = self._validate_log_level(level)
         min_level = self._levels.get(session_id, self._DEFAULT_LEVEL)

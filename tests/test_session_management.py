@@ -146,6 +146,79 @@ def test_oauth_initialize_creates_session_and_returns_header(
 
 
 @pytest.mark.integration
+def test_oauth_session_getter_path_does_not_persist_negotiated_protocol_version(
+    connection_id: UUID,
+):
+    """Documents a known limitation: unlike session_store, the callback-based
+    session_getter/session_creator path has no way to persist the protocol
+    version negotiated at initialize (McpSessionData has no protocol_version
+    field, and SessionCreator is not passed one). A later request that omits
+    the header re-negotiates from scratch and defaults to 2025-03-26, so
+    icons gated on 2025-11-25 are omitted even though the session originally
+    negotiated 2025-11-25. See _resolve_session's docstring in router.py."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(icons=[{"src": "https://example.com/icon.png"}])
+    async def icon_tool() -> str:
+        """Tool with icon."""
+        return "ok"
+
+    session_store: dict[str, McpSessionData] = {}
+
+    async def session_getter(session_id: str) -> McpSessionData | None:
+        return session_store.get(session_id)
+
+    async def session_creator(oauth_client_id: UUID | None, conn_id: UUID | None) -> str:
+        session_id = f"session_{uuid4()}"
+        session_store[session_id] = McpSessionData(
+            session_id=session_id,
+            oauth_client_id=oauth_client_id,
+            connection_id=conn_id,
+            last_event_id=0,
+            created_at=datetime.now(),
+        )
+        return session_id
+
+    async def auth_validator(api_key: str | None, bearer_token: str | None) -> bool:
+        return bearer_token == "valid-token"
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def set_connection_id(request: Request, call_next):
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            request.state.connection_id = connection_id
+        return await call_next(request)
+
+    mcp_router = create_mcp_router(
+        registry,
+        auth_validator=auth_validator,
+        session_getter=session_getter,
+        session_creator=session_creator,
+    )
+    app.include_router(mcp_router, prefix="/mcp")
+    client = TestClient(app)
+
+    init_response = client.post(
+        "/mcp",
+        json=make_jsonrpc_request(method="initialize", params={"protocolVersion": "2025-11-25"}),
+        headers={"MCP-Protocol-Version": "2025-11-25", "Authorization": "Bearer valid-token"},
+    )
+    session_id = init_response.headers["Mcp-Session-Id"]
+
+    # Subsequent request omits MCP-Protocol-Version entirely.
+    list_response = client.post(
+        "/mcp",
+        json=make_jsonrpc_request(method="tools/list"),
+        headers={"Authorization": "Bearer valid-token", "Mcp-Session-Id": session_id},
+    )
+
+    tools = list_response.json()["result"]["tools"]
+    assert "icons" not in tools[0]
+
+
+@pytest.mark.integration
 def test_oauth_initialize_without_connection_id_returns_401(
     registry: MCPToolRegistry,
     session_store: dict[str, McpSessionData],

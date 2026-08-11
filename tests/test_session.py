@@ -35,8 +35,8 @@ async def _create_session(store: InMemorySessionStore) -> Session:
 
 
 @pytest.mark.unit
-def test_session_store_has_six_abstract_methods():
-    """SessionStore ABC exposes exactly 6 abstract methods (AC-16)."""
+def test_session_store_has_eight_abstract_methods():
+    """SessionStore ABC exposes exactly 8 abstract methods."""
     abstract_methods = {
         name for name, member in inspect.getmembers(SessionStore) if getattr(member, "__isabstractmethod__", False)
     }
@@ -47,6 +47,8 @@ def test_session_store_has_six_abstract_methods():
         "delete",
         "enqueue_message",
         "dequeue_messages",
+        "list_sessions",
+        "find_subscribers",
     }
 
 
@@ -59,8 +61,17 @@ def test_session_store_cannot_be_instantiated_directly():
 
 @pytest.mark.unit
 def test_all_abstract_methods_are_async():
-    """All 6 SessionStore abstract methods are declared as coroutine functions."""
-    for name in ("create", "get", "update", "delete", "enqueue_message", "dequeue_messages"):
+    """All 8 SessionStore abstract methods are declared as coroutine functions."""
+    for name in (
+        "create",
+        "get",
+        "update",
+        "delete",
+        "enqueue_message",
+        "dequeue_messages",
+        "list_sessions",
+        "find_subscribers",
+    ):
         method = getattr(SessionStore, name)
         assert asyncio.iscoroutinefunction(method), f"{name} must be async"
 
@@ -423,6 +434,60 @@ async def test_session_at_ttl_boundary_is_not_expired():
     await store.update(session)
     result = await store.get(session.session_id)
     assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# list_sessions() / find_subscribers()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_sessions_returns_all_live_ids():
+    """list_sessions() returns every non-expired session id."""
+    store = _make_store()
+    session_a = await _create_session(store)
+    session_b = await _create_session(store)
+    ids = await store.list_sessions()
+    assert set(ids) == {session_a.session_id, session_b.session_id}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_sessions_excludes_expired_sessions():
+    """list_sessions() omits sessions whose TTL has elapsed."""
+    store = _make_store(ttl_seconds=1)
+    live = await _create_session(store)
+    expired = await _create_session(store)
+    expired.last_activity = datetime.now(UTC) - timedelta(seconds=2)
+    await store.update(expired)
+    ids = await store.list_sessions()
+    assert ids == [live.session_id]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_returns_only_matching_sessions():
+    """find_subscribers(uri) returns only sessions whose subscriptions contain uri."""
+    store = _make_store()
+    subscribed = await _create_session(store)
+    subscribed.subscriptions.add("file:///a.txt")
+    await store.update(subscribed)
+    other = await _create_session(store)
+    other.subscriptions.add("file:///b.txt")
+    await store.update(other)
+    ids = await store.find_subscribers("file:///a.txt")
+    assert ids == [subscribed.session_id]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_returns_empty_list_when_no_matches():
+    """find_subscribers(uri) returns [] when no session subscribes to uri."""
+    store = _make_store()
+    await _create_session(store)
+    ids = await store.find_subscribers("file:///nonexistent.txt")
+    assert ids == []
 
 
 # ---------------------------------------------------------------------------

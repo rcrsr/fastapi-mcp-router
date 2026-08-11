@@ -1,11 +1,8 @@
-"""Tests for SessionStore ABC, InMemorySessionStore, DELETE endpoint, and router validation.
-
-Covers AC-16, AC-17, AC-18, AC-19, AC-20, AC-21, AC-88, AC-97, AC-98, EC-11, EC-13.
-"""
+"""Tests for SessionStore ABC, InMemorySessionStore, DELETE endpoint, and router validation."""
 
 import asyncio
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import httpx
@@ -21,12 +18,12 @@ from fastapi_mcp_router.types import McpSessionData
 
 
 @pytest.mark.unit
-def test_session_store_abc_has_six_abstract_methods() -> None:
-    """AC-16: SessionStore defines exactly 6 abstract methods."""
+def test_session_store_abc_has_eight_abstract_methods() -> None:
+    """SessionStore defines exactly 8 abstract methods."""
     abstract_methods = {
         name for name, method in inspect.getmembers(SessionStore) if getattr(method, "__isabstractmethod__", False)
     }
-    assert len(abstract_methods) == 6
+    assert len(abstract_methods) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +96,88 @@ async def test_delete_valid_session_returns_204() -> None:
 # ---------------------------------------------------------------------------
 # AC-19: DELETE returns 404 on unknown session
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_session_stores_negotiated_not_raw_protocol_version() -> None:
+    """Session creation stores the negotiated/clamped protocol version, not the raw header."""
+    registry = MCPToolRegistry()
+    store = InMemorySessionStore()
+
+    router = create_mcp_router(registry, session_store=store)
+    app = FastAPI()
+    app.include_router(router, prefix="/mcp")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        init_resp = await client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-08-01",
+                    "clientInfo": {},
+                    "capabilities": {},
+                },
+            },
+            # Raw header requests an unsupported version between two supported
+            # versions; the router negotiates/clamps it down to "2025-06-18".
+            headers={"MCP-Protocol-Version": "2025-08-01", "X-API-Key": "test-key"},
+        )
+        session_id = init_resp.headers.get("Mcp-Session-Id")
+        assert session_id is not None
+
+        session = await store.get(session_id)
+        assert session is not None
+        assert session.protocol_version == "2025-06-18"
+        assert session.protocol_version != "2025-08-01"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_stateful_session_does_not_downgrade_on_missing_header() -> None:
+    """A session negotiated at 2025-11-25 keeps emitting icons even when a later
+    request omits the MCP-Protocol-Version header (which would otherwise default
+    to 2025-03-26 and gate icons off)."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(icons=[{"src": "https://example.com/icon.png"}])
+    async def icon_tool() -> str:
+        """Tool with icon."""
+        return "ok"
+
+    store = InMemorySessionStore()
+    router = create_mcp_router(registry, session_store=store)
+    app = FastAPI()
+    app.include_router(router, prefix="/mcp")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        init_resp = await client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "clientInfo": {}, "capabilities": {}},
+            },
+            headers={"MCP-Protocol-Version": "2025-11-25", "X-API-Key": "test-key"},
+        )
+        session_id = init_resp.headers.get("Mcp-Session-Id")
+        assert session_id is not None
+
+        # Subsequent request omits MCP-Protocol-Version entirely.
+        list_resp = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            headers={"X-API-Key": "test-key", "Mcp-Session-Id": session_id},
+        )
+
+    tools = list_resp.json()["result"]["tools"]
+    assert tools[0]["icons"] == [{"src": "https://example.com/icon.png"}]
 
 
 @pytest.mark.integration
@@ -281,18 +360,20 @@ async def test_dequeue_empty_queue_returns_empty_list() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC-97: Expired session → get() returns None
+# Expired session → get() returns None
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_expired_session_returns_none() -> None:
-    """AC-97: After TTL elapses, get() returns None for the expired session."""
+    """After TTL elapses, get() returns None for the expired session."""
     store = InMemorySessionStore(ttl_seconds=1)
     session = await store.create("2025-06-18", {}, {})
 
-    await asyncio.sleep(1.1)
+    # Directly manipulate last_activity to simulate TTL elapsing, avoiding a
+    # real sleep-based race between the test clock and the TTL window.
+    session.last_activity -= timedelta(seconds=1.1)
 
     result = await store.get(session.session_id)
     assert result is None

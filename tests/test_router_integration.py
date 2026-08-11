@@ -5,6 +5,7 @@ Covers initialize, notifications/initialized, tools/list, tools/call, ping metho
 header validation, and JSON-RPC error handling.
 """
 
+from collections.abc import Mapping
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -17,8 +18,10 @@ from fastapi_mcp_router import (
     MCPError,
     MCPToolRegistry,
     ToolError,
+    __version__,
     create_mcp_router,
 )
+from fastapi_mcp_router.router import _SUPPORTED_PROTOCOL_VERSIONS, _negotiate_protocol_version
 from fastapi_mcp_router.types import McpSessionData, ServerInfo
 
 # Test fixtures
@@ -81,7 +84,7 @@ def client_fixture(app: FastAPI) -> TestClient:
 
 def make_jsonrpc_request(
     method: str,
-    params: dict[str, object] | None = None,
+    params: Mapping[str, object] | None = None,
     request_id: int | str | None = 1,
 ) -> dict[str, object]:
     """Create JSON-RPC 2.0 request body.
@@ -107,7 +110,7 @@ def make_jsonrpc_request(
 
 def post_mcp(
     client: TestClient,
-    body: dict[str, object],
+    body: Mapping[str, object],
     protocol_version: str = "2025-06-18",
     auth_header: str | None = "test-api-key",
 ) -> httpx.Response:
@@ -195,7 +198,7 @@ def test_initialize_server_info(client: TestClient):
     assert "name" in result["serverInfo"]
     assert "version" in result["serverInfo"]
     assert result["serverInfo"]["name"] == "fastapi-mcp-router"
-    assert result["serverInfo"]["version"] == "0.1.0"
+    assert result["serverInfo"]["version"] == __version__
 
 
 @pytest.mark.integration
@@ -240,7 +243,7 @@ def test_initialize_partial_server_info_merges_defaults(registry: MCPToolRegistr
     result = response.json()["result"]
     # Defaults preserved
     assert result["serverInfo"]["name"] == "fastapi-mcp-router"
-    assert result["serverInfo"]["version"] == "0.1.0"
+    assert result["serverInfo"]["version"] == __version__
     # Custom field added
     assert result["serverInfo"]["title"] == "Just a Title"
 
@@ -582,6 +585,62 @@ def test_ping_with_correct_headers(client: TestClient):
     assert "error" not in data
 
 
+# Version negotiation unit tests
+
+
+@pytest.mark.unit
+def test_supported_protocol_versions_whitelist_is_exact():
+    """Test the supported version whitelist contains exactly the three versions."""
+    assert _SUPPORTED_PROTOCOL_VERSIONS == ("2025-11-25", "2025-06-18", "2025-03-26")
+
+
+@pytest.mark.unit
+def test_negotiate_protocol_version_below_all_supported_raises_mcp_error():
+    """Test negotiating a version below all supported versions raises MCPError."""
+    with pytest.raises(MCPError) as exc_info:
+        _negotiate_protocol_version("2024-01-01")
+
+    assert exc_info.value.code == -32602
+    assert "2024-01-01" in exc_info.value.message
+    assert exc_info.value.data == {
+        "supported": ["2025-11-25", "2025-06-18", "2025-03-26"],
+        "requested": "2024-01-01",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("requested", ["abc", "zzzz", "v1", "", "2025-11"])
+def test_negotiate_protocol_version_malformed_shape_raises_mcp_error(requested: str):
+    """Test malformed non-date-shaped version strings raise MCPError instead of clamping."""
+    with pytest.raises(MCPError) as exc_info:
+        _negotiate_protocol_version(requested)
+
+    assert exc_info.value.code == -32602
+    assert exc_info.value.data == {
+        "supported": ["2025-11-25", "2025-06-18", "2025-03-26"],
+        "requested": requested,
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("version", ["2025-11-25", "2025-06-18", "2025-03-26"])
+def test_negotiate_protocol_version_supported_versions_negotiate_to_self(version: str):
+    """Test each whitelisted version negotiates to itself."""
+    assert _negotiate_protocol_version(version) == version
+
+
+@pytest.mark.unit
+def test_negotiate_protocol_version_above_max_clamps_down():
+    """Test a well-formed version above the max supported clamps to the newest."""
+    assert _negotiate_protocol_version("2026-07-28") == "2025-11-25"
+
+
+@pytest.mark.unit
+def test_negotiate_protocol_version_between_supported_clamps_to_highest_at_or_below():
+    """Test a well-formed intermediate version clamps to the highest supported at or below it."""
+    assert _negotiate_protocol_version("2025-08-01") == "2025-06-18"
+
+
 # Header validation tests
 
 
@@ -601,16 +660,102 @@ def test_missing_protocol_version_header_defaults_to_2025_03_26(client: TestClie
 
 
 @pytest.mark.integration
-def test_unsupported_protocol_version_returns_400(client: TestClient):
-    """Test unsupported protocol version returns 400."""
-    request = make_jsonrpc_request(method="ping")
+def test_protocol_version_below_all_supported_returns_json_rpc_error(client: TestClient):
+    """Test a requested version below all supported versions cannot be clamped."""
+    request = make_jsonrpc_request(method="ping", request_id=1)
 
     response = post_mcp(client, request, protocol_version="1.0.0")
 
-    assert response.status_code == 400
+    assert response.status_code == 200
     data = response.json()
     assert "error" in data
-    assert "unsupported" in data["error"].lower() or "supported" in data["error"].lower()
+    assert data["error"]["code"] == -32602
+    assert "1.0.0" in data["error"]["message"]
+    assert data["error"]["data"]["requested"] == "1.0.0"
+    assert data["error"]["data"]["supported"] == [
+        "2025-11-25",
+        "2025-06-18",
+        "2025-03-26",
+    ]
+
+
+@pytest.mark.integration
+def test_protocol_version_malformed_header_returns_json_rpc_error(client: TestClient):
+    """Test a malformed MCP-Protocol-Version header rejects with a JSON-RPC error, not a clamp."""
+    request = make_jsonrpc_request(method="ping", request_id=1)
+
+    response = post_mcp(client, request, protocol_version="abc")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "error" in data
+    assert data["error"]["code"] == -32602
+    assert data["error"]["data"]["requested"] == "abc"
+
+
+@pytest.mark.integration
+def test_protocol_version_above_max_clamps_to_newest_supported(client: TestClient):
+    """Test a requested version above the max supported clamps to the newest."""
+    request = make_jsonrpc_request(
+        method="initialize",
+        params={"protocolVersion": "2026-07-28"},
+        request_id=1,
+    )
+
+    response = post_mcp(client, request, protocol_version="2026-07-28")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["result"]["protocolVersion"] == "2025-11-25"
+
+
+@pytest.mark.integration
+def test_protocol_version_newest_supported_negotiates_unchanged(client: TestClient):
+    """Test requesting the newest supported version negotiates to itself."""
+    request = make_jsonrpc_request(
+        method="initialize",
+        params={"protocolVersion": "2025-11-25"},
+        request_id=1,
+    )
+
+    response = post_mcp(client, request, protocol_version="2025-11-25")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["result"]["protocolVersion"] == "2025-11-25"
+
+
+@pytest.mark.integration
+def test_protocol_version_oldest_supported_negotiates_unchanged(client: TestClient):
+    """Test requesting the oldest supported version negotiates to itself."""
+    request = make_jsonrpc_request(
+        method="initialize",
+        params={"protocolVersion": "2025-03-26"},
+        request_id=1,
+    )
+
+    response = post_mcp(client, request, protocol_version="2025-03-26")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["result"]["protocolVersion"] == "2025-03-26"
+
+
+@pytest.mark.integration
+def test_protocol_version_intermediate_clamps_to_highest_at_or_below(client: TestClient):
+    """Test a non-whitelisted intermediate version clamps down, not an error."""
+    request = make_jsonrpc_request(
+        method="initialize",
+        params={"protocolVersion": "2025-08-01"},
+        request_id=1,
+    )
+
+    response = post_mcp(client, request, protocol_version="2025-08-01")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "error" not in data
+    assert data["result"]["protocolVersion"] == "2025-06-18"
 
 
 @pytest.mark.integration
@@ -680,6 +825,20 @@ def test_method_not_found_returns_error_32601(client: TestClient):
     assert "error" in data
     assert data["error"]["code"] == -32601
     assert "not found" in data["error"]["message"].lower()
+
+
+@pytest.mark.integration
+def test_roots_list_returns_method_not_found(client: TestClient):
+    """Test roots/list is not served by the router and returns -32601."""
+    request = make_jsonrpc_request(method="roots/list")
+
+    response = post_mcp(client, request)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "error" in data
+    assert data["error"]["code"] == -32601
+    assert "roots/list" in data["error"]["message"]
 
 
 # Response format validation tests

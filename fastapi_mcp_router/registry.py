@@ -152,6 +152,11 @@ class ToolDefinition:
         handler: Async function implementing tool logic
         is_generator: True when handler is an AsyncGenerator[dict, None]
         output_schema: Optional JSON schema describing structured tool output
+        title: Optional human-readable display label, distinct from name
+        icons: Optional list of icon descriptors. Each entry is validated
+            against Icon at registration time in MCPToolRegistry.tool(),
+            then stored here verbatim (not the validated model dump) so
+            vendor-specific keys survive unmodified.
     """
 
     name: str
@@ -161,6 +166,8 @@ class ToolDefinition:
     handler: Callable
     is_generator: bool
     output_schema: dict[str, object] | None
+    title: str | None
+    icons: list[dict[str, object]] | None
 
     def __init__(
         self,
@@ -171,6 +178,8 @@ class ToolDefinition:
         annotations: dict[str, object] | None = None,
         is_generator: bool = False,
         output_schema: dict[str, object] | None = None,
+        title: str | None = None,
+        icons: list[dict[str, object]] | None = None,
     ) -> None:
         """Initialize tool definition.
 
@@ -182,6 +191,8 @@ class ToolDefinition:
             annotations: Optional MCP annotations for tool capabilities
             is_generator: True when handler yields via AsyncGenerator[dict, None]
             output_schema: Optional JSON schema describing structured tool output
+            title: Optional human-readable display label, distinct from name
+            icons: Optional list of icon descriptors, verbatim dicts
         """
         self.name = name
         self.description = description
@@ -190,6 +201,8 @@ class ToolDefinition:
         self.handler = handler
         self.is_generator = is_generator
         self.output_schema = output_schema
+        self.title = title
+        self.icons = icons
 
 
 class MCPToolRegistry:
@@ -278,6 +291,8 @@ class MCPToolRegistry:
         input_schema: dict[str, object] | None = None,
         annotations: dict[str, object] | None = None,
         output_schema: dict[str, object] | None = None,
+        title: str | None = None,
+        icons: list[dict[str, object]] | None = None,
     ) -> Callable:
         """Register function as MCP tool.
 
@@ -289,16 +304,29 @@ class MCPToolRegistry:
             name: Tool name (defaults to function name)
             description: Tool description (defaults to function docstring)
             input_schema: JSON schema for parameters (auto-generated if not provided)
-            annotations: MCP annotations for tool capabilities (e.g., {"readOnlyHint": True})
+            annotations: MCP annotations for tool capabilities (e.g., {"readOnlyHint": True}).
+                Validated via ToolAnnotations.model_validate() at registration
+                time; unknown/vendor keys are preserved verbatim since
+                ToolAnnotations allows extra fields.
             output_schema: JSON schema describing structured tool output. When set,
                 outputSchema is included in tools/list and call_tool returns
                 structuredContent alongside the backward-compatible text content.
+            title: Human-readable display label for the tool. Distinct from name;
+                never defaults to it. Omitted from tools/list when not provided.
+            icons: Optional list of icon descriptor dicts. Each entry is
+                validated via Icon.model_validate() at registration time, then
+                stored and re-emitted verbatim (preserving vendor-specific
+                keys). Only emitted in tools/list for clients negotiating a
+                protocol version that supports icons.
 
         Returns:
             Decorator function that returns original function unchanged
 
         Raises:
             TypeError: If decorated function is not async
+            pydantic.ValidationError: If an icon dict fails Icon validation
+                (e.g. src uses a disallowed scheme), or if a known annotation
+                field (e.g. readOnlyHint) fails ToolAnnotations validation
 
         Example:
             >>> @tools.tool()
@@ -371,6 +399,23 @@ class MCPToolRegistry:
                 return_hint = None
             is_gen = _is_async_generator_annotation(return_hint)
 
+            if icons is not None:
+                # Deferred import: types.py is a leaf module (no internal imports).
+                # Module-level import of types.py is forbidden by §LIB.3.1.
+                from fastapi_mcp_router.types import Icon
+
+                for icon in icons:
+                    Icon.model_validate(icon)
+
+            if annotations is not None:
+                # Deferred import: types.py is a leaf module (no internal imports).
+                # Module-level import of types.py is forbidden by §LIB.3.1.
+                from fastapi_mcp_router.types import ToolAnnotations
+
+                # extra="allow" on ToolAnnotations preserves vendor/unknown keys
+                # verbatim while still type-checking the known hint fields.
+                ToolAnnotations.model_validate(annotations)
+
             # Store tool definition
             self._tools[tool_name] = ToolDefinition(
                 name=tool_name,
@@ -380,6 +425,8 @@ class MCPToolRegistry:
                 annotations=annotations,
                 is_generator=is_gen,
                 output_schema=output_schema,
+                title=title,
+                icons=icons,
             )
 
             return func
@@ -523,16 +570,23 @@ class MCPToolRegistry:
             "required": schema.get("required", []),
         }
 
-    def list_tools(self) -> list[dict[str, object]]:
+    def list_tools(self, protocol_version: str | None = None) -> list[dict[str, object]]:
         """List all registered tools with schemas.
 
         Returns list of tool definitions in MCP format with name, description,
-        inputSchema, and optional annotations fields. Used by MCP protocol to
-        expose available tools to clients.
+        inputSchema, and optional title/annotations/outputSchema/icons fields.
+        Used by MCP protocol to expose available tools to clients.
+
+        Args:
+            protocol_version: Negotiated MCP protocol version string (e.g.
+                "2025-11-25"). Controls whether icons are emitted: icons
+                require a version of "2025-11-25" or later. Defaults to None,
+                which omits icons regardless of whether a tool defines them.
 
         Returns:
             List of tool definition dicts with name, description, inputSchema,
-            and annotations (if provided)
+            title (if provided), annotations (if provided), outputSchema (if
+            provided), and icons (if provided and protocol_version supports it)
 
         Example:
             >>> tools = MCPToolRegistry()
@@ -568,19 +622,72 @@ class MCPToolRegistry:
             >>> print(tool_list[0]["annotations"])
             {'readOnlyHint': True}
         """
-        result = []
-        for tool in self._tools.values():
-            tool_dict: dict[str, object] = {
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-            }
-            if tool.annotations is not None:
-                tool_dict["annotations"] = tool.annotations
-            if tool.output_schema is not None:
-                tool_dict["outputSchema"] = tool.output_schema
-            result.append(tool_dict)
-        return result
+        return [self.shape_tool(tool, protocol_version) for tool in self._tools.values()]
+
+    def shape_tool(self, tool: ToolDefinition, protocol_version: str | None = None) -> dict[str, object]:
+        """Format a single tool definition for the MCP wire protocol.
+
+        Extracted from list_tools so callers that paginate (e.g.
+        handle_tools_list in router.py) can shape only the page of tools
+        being returned instead of the entire registry.
+
+        Args:
+            tool: Raw tool definition to format.
+            protocol_version: Negotiated MCP protocol version string.
+                Controls whether icons are emitted.
+
+        Returns:
+            Tool definition dict with name, description, inputSchema, and
+            optional title/annotations/outputSchema/icons fields.
+
+        Example:
+            >>> registry = MCPToolRegistry()
+            >>> tool = registry.get_raw_tools()[0]  # doctest: +SKIP
+            >>> registry.shape_tool(tool)["name"]  # doctest: +SKIP
+            'greet'
+        """
+        # Deferred import: types.py is a leaf module (no internal imports).
+        # Module-level import of types.py is forbidden by §LIB.3.1.
+        from fastapi_mcp_router.types import icons_supported
+
+        tool_dict: dict[str, object] = {
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": tool.input_schema,
+        }
+        if tool.title is not None:
+            tool_dict["title"] = tool.title
+        if tool.annotations is not None:
+            tool_dict["annotations"] = tool.annotations
+        if tool.output_schema is not None:
+            tool_dict["outputSchema"] = tool.output_schema
+        if tool.icons is not None and icons_supported(protocol_version):
+            tool_dict["icons"] = tool.icons
+        return tool_dict
+
+    def get_raw_tools(self) -> list[ToolDefinition]:
+        """Return raw tool definitions in registration order, unshaped.
+
+        Enables callers to paginate the raw registry before shaping items to
+        the wire format, so shaping cost is bounded by page size rather than
+        registry size.
+
+        Returns:
+            List of ToolDefinition objects in registration order.
+
+        Example:
+            >>> tools = MCPToolRegistry()
+            >>>
+            >>> @tools.tool()
+            >>> async def greet(name: str) -> str:
+            ...     '''Greet a user.'''
+            ...     return f"Hello, {name}"
+            >>>
+            >>> raw = tools.get_raw_tools()
+            >>> raw[0].name
+            'greet'
+        """
+        return list(self._tools.values())
 
     async def call_tool(
         self,
@@ -734,7 +841,7 @@ class MCPToolRegistry:
 
             result = await tool.handler(**call_kwargs)
 
-            # AC-69: when output_schema is set, return structured content alongside
+            # When output_schema is set, return structured content alongside
             # backward-compatible text content (MCP 2025-06-18 structuredContent field).
             if tool.output_schema is not None:
                 result_text = json.dumps(result) if not isinstance(result, str) else result
@@ -879,7 +986,7 @@ class MCPToolRegistry:
     ) -> list[dict]:
         """Iterate an AsyncGenerator tool, collecting yielded dicts into a list.
 
-        Handles EC-9 (non-dict yield) and EC-10 (generator exception) by
+        Handles (non-dict yield) and (generator exception) by
         raising ToolError so the LLM can recover.
 
         Args:

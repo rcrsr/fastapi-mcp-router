@@ -35,6 +35,7 @@ def _make_redis_mock() -> MagicMock:
     redis.llen = AsyncMock(return_value=0)
     redis.lpush = AsyncMock(return_value=1)
     redis.lrange = AsyncMock(return_value=[])
+    redis.mget = AsyncMock(return_value=[])
 
     pipe = MagicMock()
     pipe.lrange = MagicMock()
@@ -493,3 +494,182 @@ async def test_dequeue_messages_redis_failure_raises_mcp_error():
     assert exc_info.value.code == -32603
     assert pipe.execute.call_count == 2
     mock_sleep.assert_awaited_once_with(0.5)
+
+
+# ---------------------------------------------------------------------------
+# list_sessions() / find_subscribers() — SCAN-based key enumeration
+# ---------------------------------------------------------------------------
+
+
+def _make_scan_iter(keys: list[str]):
+    """Build an async generator matching redis.asyncio scan_iter's signature."""
+
+    async def scan_iter(match: str | None = None):
+        for key in keys:
+            yield key
+
+    return scan_iter
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_sessions_returns_ids_from_scan():
+    """list_sessions() strips the key prefix from each SCAN-matched key."""
+    store, redis_mock = _make_store()
+    redis_mock.scan_iter = _make_scan_iter(["mcp:session:aaa", "mcp:session:bbb"])
+
+    ids = await store.list_sessions()
+
+    assert set(ids) == {"aaa", "bbb"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_sessions_redis_failure_raises_mcp_error():
+    """list_sessions() raises MCPError -32603 when SCAN fails."""
+    store, redis_mock = _make_store()
+
+    async def failing_scan_iter(match: str | None = None):
+        raise ConnectionError("Redis unavailable")
+        yield  # pragma: no cover - unreachable, satisfies generator syntax
+
+    redis_mock.scan_iter = failing_scan_iter
+
+    with pytest.raises(MCPError) as exc_info:
+        await store.list_sessions()
+
+    assert exc_info.value.code == -32603
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_returns_only_matching_sessions():
+    """find_subscribers(uri) batch-reads scanned sessions via MGET and filters by subscriptions."""
+    store, redis_mock = _make_store()
+    subscribed = _make_session("sess-sub")
+    subscribed.subscriptions.add("file:///a.txt")
+    other = _make_session("sess-other")
+    other.subscriptions.add("file:///b.txt")
+    redis_mock.scan_iter = _make_scan_iter(["mcp:session:sess-sub", "mcp:session:sess-other"])
+    redis_mock.mget = AsyncMock(
+        return_value=[
+            _serialize_session(store, subscribed),
+            _serialize_session(store, other),
+        ]
+    )
+
+    ids = await store.find_subscribers("file:///a.txt")
+
+    assert ids == ["sess-sub"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_returns_empty_list_when_no_matches():
+    """find_subscribers(uri) returns [] when no scanned session subscribes to uri."""
+    store, redis_mock = _make_store()
+    redis_mock.scan_iter = _make_scan_iter([])
+
+    ids = await store.find_subscribers("file:///nonexistent.txt")
+
+    assert ids == []
+    redis_mock.mget.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_batches_reads_with_single_mget_call():
+    """find_subscribers(uri) issues exactly one MGET round-trip regardless of matched key count.
+
+    This is the batching regression guard: a per-key GET loop would call
+    redis.get() once per scanned key; the batched implementation must call
+    redis.mget() exactly once, with zero calls to redis.get().
+    """
+    store, redis_mock = _make_store()
+    subscribed = _make_session("sess-sub")
+    subscribed.subscriptions.add("file:///a.txt")
+    other = _make_session("sess-other")
+    third = _make_session("sess-third")
+    redis_mock.scan_iter = _make_scan_iter(["mcp:session:sess-sub", "mcp:session:sess-other", "mcp:session:sess-third"])
+    redis_mock.mget = AsyncMock(
+        return_value=[
+            _serialize_session(store, subscribed),
+            _serialize_session(store, other),
+            _serialize_session(store, third),
+        ]
+    )
+
+    ids = await store.find_subscribers("file:///a.txt")
+
+    assert ids == ["sess-sub"]
+    redis_mock.mget.assert_called_once_with(
+        ["mcp:session:sess-sub", "mcp:session:sess-other", "mcp:session:sess-third"]
+    )
+    redis_mock.get.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_skips_key_that_expires_between_scan_and_mget():
+    """A key present in SCAN but expired by the time MGET runs yields None and is skipped.
+
+    MGET returns None for any key that no longer exists, matching Redis's
+    documented behavior for missing keys in a bulk read.
+    """
+    store, redis_mock = _make_store()
+    subscribed = _make_session("sess-sub")
+    subscribed.subscriptions.add("file:///a.txt")
+    redis_mock.scan_iter = _make_scan_iter(["mcp:session:sess-sub", "mcp:session:sess-expired"])
+    redis_mock.mget = AsyncMock(return_value=[_serialize_session(store, subscribed), None])
+
+    ids = await store.find_subscribers("file:///a.txt")
+
+    assert ids == ["sess-sub"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_batches_mget_when_key_count_exceeds_chunk_size():
+    """find_subscribers(uri) issues one MGET per chunk instead of a single
+    MGET spanning the entire keyspace, bounding peak memory during a scan
+    over more sessions than fit in one chunk."""
+    from fastapi_mcp_router.session import _SCAN_MGET_CHUNK_SIZE
+
+    store, redis_mock = _make_store()
+    subscribed = _make_session("sess-sub")
+    subscribed.subscriptions.add("file:///a.txt")
+    other = _make_session("sess-other")
+
+    key_count = _SCAN_MGET_CHUNK_SIZE + 1
+    keys = [f"mcp:session:sess-{i}" for i in range(key_count - 1)] + ["mcp:session:sess-sub"]
+    redis_mock.scan_iter = _make_scan_iter(keys)
+
+    async def fake_mget(batch_keys: list[str]) -> list[str | None]:
+        return [
+            _serialize_session(store, subscribed) if k == "mcp:session:sess-sub" else _serialize_session(store, other)
+            for k in batch_keys
+        ]
+
+    redis_mock.mget = AsyncMock(side_effect=fake_mget)
+
+    ids = await store.find_subscribers("file:///a.txt")
+
+    assert ids == ["sess-sub"]
+    assert redis_mock.mget.call_count == 2
+    first_call_keys, second_call_keys = (call.args[0] for call in redis_mock.mget.call_args_list)
+    assert len(first_call_keys) == _SCAN_MGET_CHUNK_SIZE
+    assert len(second_call_keys) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_subscribers_redis_failure_raises_mcp_error():
+    """find_subscribers(uri) raises MCPError -32603 when MGET fails."""
+    store, redis_mock = _make_store()
+    redis_mock.scan_iter = _make_scan_iter(["mcp:session:sess-1"])
+    redis_mock.mget = AsyncMock(side_effect=ConnectionError("Redis unavailable"))
+
+    with pytest.raises(MCPError) as exc_info:
+        await store.find_subscribers("file:///a.txt")
+
+    assert exc_info.value.code == -32603

@@ -1,8 +1,8 @@
 """Backwards compatibility tests for fastapi-mcp-router public API.
 
 Verifies that MCPToolRegistry + create_mcp_router() API is unchanged after
-the MCPRouter refactor. Covers AC-39: all 16 exports remain in __all__,
-existing tool call flows work, and conftest session_client fixture pattern
+the MCPRouter refactor: all expected exports remain in __all__, existing
+tool call flows work, and the conftest session_client fixture pattern
 functions correctly.
 """
 
@@ -20,7 +20,7 @@ from fastapi_mcp_router import MCPToolRegistry, create_mcp_router
 from fastapi_mcp_router.types import McpSessionData
 
 # ---------------------------------------------------------------------------
-# AC-39: all expected exports present in __all__
+# All expected exports present in __all__
 # ---------------------------------------------------------------------------
 
 
@@ -28,7 +28,7 @@ from fastapi_mcp_router.types import McpSessionData
 def test_all_exports_present_in_dunder_all():
     """Test all 16 expected public names exist in fastapi_mcp_router.__all__.
 
-    AC-39: no symbols removed or renamed by MCPRouter refactor.
+    No symbols were removed or renamed by the MCPRouter refactor.
     """
     expected = {
         "EventSubscriber",
@@ -56,18 +56,59 @@ def test_all_exports_present_in_dunder_all():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AudioContent",
+        "Icon",
+        "ImageContent",
+        "ResourceLinkContent",
+        "ToolAnnotations",
+        "encode_cursor",
+        "paginate",
+    ],
+)
+def test_spec_compliance_export_present_in_dunder_all(name: str) -> None:
+    """Test each 0.4.0 spec-compliance symbol is present in __all__.
+
+    Uses a containment assertion (not an equality/length assertion on
+    __all__) because a sibling initiative on a different branch appends
+    its own exports to this same list.
+    """
+    assert name in fastapi_mcp_router.__all__
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AudioContent",
+        "Icon",
+        "ImageContent",
+        "ResourceLinkContent",
+        "ToolAnnotations",
+        "encode_cursor",
+        "paginate",
+    ],
+)
+def test_spec_compliance_export_importable_from_top_level(name: str) -> None:
+    """Test each 0.4.0 spec-compliance symbol is importable from the top-level package."""
+    assert hasattr(fastapi_mcp_router, name), f"{name!r} in __all__ but not importable"
+
+
+@pytest.mark.unit
 def test_all_exports_importable_from_top_level():
     """Test every name in __all__ is importable from the top-level package.
 
-    AC-39: each symbol resolves without AttributeError, proving the export
-    is backed by a real object and not a stub entry in __all__.
+    Each symbol resolves without AttributeError, proving the export is
+    backed by a real object and not a stub entry in __all__.
     """
     for name in fastapi_mcp_router.__all__:
         assert hasattr(fastapi_mcp_router, name), f"{name!r} in __all__ but not importable"
 
 
 # ---------------------------------------------------------------------------
-# AC-39: MCPToolRegistry + create_mcp_router() end-to-end tool call
+# MCPToolRegistry + create_mcp_router() end-to-end tool call
 # ---------------------------------------------------------------------------
 
 
@@ -118,8 +159,8 @@ async def test_mcptoolregistry_create_mcp_router_tool_call_succeeds(
 ) -> None:
     """Test MCPToolRegistry + create_mcp_router() tool call returns expected result.
 
-    AC-39: the full legacy path (register tool, build router, call via HTTP)
-    works identically after the MCPRouter refactor.
+    The full legacy path (register tool, build router, call via HTTP) works
+    identically after the MCPRouter refactor.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -159,7 +200,7 @@ async def test_mcptoolregistry_create_mcp_router_tools_list_unchanged(
 ) -> None:
     """Test tools/list returns the registered echo tool via the legacy API.
 
-    AC-39: tools/list response format is unchanged after refactor.
+    tools/list response format is unchanged after refactor.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -186,7 +227,7 @@ async def test_mcptoolregistry_create_mcp_router_tools_list_unchanged(
 
 
 # ---------------------------------------------------------------------------
-# AC-39: conftest session_client fixture pattern works post-refactor
+# conftest session_client fixture pattern works post-refactor
 # ---------------------------------------------------------------------------
 
 
@@ -194,7 +235,7 @@ async def test_mcptoolregistry_create_mcp_router_tools_list_unchanged(
 async def session_client_fixture() -> AsyncGenerator[httpx.AsyncClient]:
     """Replicate the conftest session_client fixture using the legacy create_mcp_router() API.
 
-    AC-39: existing test patterns that create session_client fixtures via
+    Existing test patterns that create session_client fixtures via
     MCPToolRegistry + create_mcp_router() still function after the refactor.
     The Bearer auth + session callbacks path exercises the stateful mode.
 
@@ -277,7 +318,7 @@ async def test_session_client_fixture_pattern_tool_call_succeeds(
 ) -> None:
     """Test the conftest session_client fixture pattern works post-refactor.
 
-    AC-39: existing integration tests that inject session_client and POST
+    Existing integration tests that inject session_client and POST
     tools/call with Bearer auth still receive a successful JSON-RPC response.
     The stateful flow requires initialize first to obtain a session ID, then
     subsequent requests include the Mcp-Session-Id header.

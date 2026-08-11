@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi_mcp_router.exceptions import MCPError
+from fastapi_mcp_router.types import Icon, icons_supported
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +61,16 @@ class PromptDefinition:
         description: Human-readable prompt description
         arguments: List of PromptArgument descriptors auto-generated from signature
         handler: Sync or async function implementing prompt logic
+        icons: Optional list of validated Icon descriptors. Only emitted in
+            prompts/list for clients negotiating a protocol version that
+            supports icons.
     """
 
     name: str
     description: str
     arguments: list[PromptArgument]
     handler: Callable
+    icons: list[Icon] | None
 
     def __init__(
         self,
@@ -73,6 +78,7 @@ class PromptDefinition:
         description: str,
         arguments: list[PromptArgument],
         handler: Callable,
+        icons: list[Icon] | None = None,
     ) -> None:
         """Initialize prompt definition.
 
@@ -81,11 +87,13 @@ class PromptDefinition:
             description: Human-readable prompt description
             arguments: List of PromptArgument descriptors
             handler: Sync or async function implementing prompt logic
+            icons: Optional list of validated Icon descriptors
         """
         self.name = name
         self.description = description
         self.arguments = arguments
         self.handler = handler
+        self.icons = icons
 
 
 class PromptRegistry:
@@ -131,6 +139,7 @@ class PromptRegistry:
         self,
         name: str | None = None,
         description: str | None = None,
+        icons: list[dict[str, object]] | None = None,
     ) -> Callable:
         """Register function as MCP prompt.
 
@@ -145,12 +154,18 @@ class PromptRegistry:
         Args:
             name: Prompt name (defaults to function name)
             description: Prompt description (defaults to function docstring)
+            icons: Optional list of icon descriptor dicts. Each entry is
+                validated via Icon.model_validate() at registration time.
+                Only emitted in prompts/list for clients negotiating a
+                protocol version that supports icons.
 
         Returns:
             Decorator function that returns the original function unchanged
 
         Raises:
             TypeError: If decorated function is not callable
+            pydantic.ValidationError: If an icon dict fails Icon validation
+                (e.g. src uses a disallowed scheme)
 
         Example:
             >>> @prompts.prompt()
@@ -173,26 +188,36 @@ class PromptRegistry:
 
             arguments = _extract_arguments(func)
 
+            validated_icons = [Icon.model_validate(icon) for icon in icons] if icons is not None else None
+
             self._prompts[prompt_name] = PromptDefinition(
                 name=prompt_name,
                 description=prompt_description,
                 arguments=arguments,
                 handler=func,
+                icons=validated_icons,
             )
 
             return func
 
         return decorator
 
-    def list_prompts(self) -> list[dict[str, object]]:
+    def list_prompts(self, protocol_version: str | None = None) -> list[dict[str, object]]:
         """List all registered prompts with arguments.
 
         Returns a list of prompt definitions in MCP format with name,
         description, and arguments fields. Used by the MCP protocol to expose
         available prompts to clients.
 
+        Args:
+            protocol_version: Negotiated MCP protocol version string (e.g.
+                "2025-11-25"). Controls whether icons are emitted: icons
+                require a version of "2025-11-25" or later. Defaults to None,
+                which omits icons regardless of whether a prompt defines them.
+
         Returns:
-            List of prompt definition dicts with name, description, and arguments
+            List of prompt definition dicts with name, description, arguments,
+            and icons (if provided and protocol_version supports it)
 
         Example:
             >>> prompts = PromptRegistry()
@@ -208,22 +233,75 @@ class PromptRegistry:
             >>> print(prompt_list[0]["arguments"][0]["name"])
             username
         """
-        result = []
-        for defn in self._prompts.values():
-            prompt_dict: dict[str, object] = {
-                "name": defn.name,
-                "description": defn.description,
-                "arguments": [
-                    {
-                        "name": arg.name,
-                        "description": arg.description,
-                        "required": arg.required,
-                    }
-                    for arg in defn.arguments
-                ],
-            }
-            result.append(prompt_dict)
-        return result
+        return [self.shape_prompt(defn, protocol_version) for defn in self._prompts.values()]
+
+    def shape_prompt(self, defn: PromptDefinition, protocol_version: str | None = None) -> dict[str, object]:
+        """Format a single prompt definition for the MCP wire protocol.
+
+        Extracted from list_prompts so callers that paginate (e.g.
+        prompts/list in router.py) can shape only the page of prompts being
+        returned instead of the entire registry.
+
+        Args:
+            defn: Raw prompt definition to format.
+            protocol_version: Negotiated MCP protocol version string.
+                Controls whether icons are emitted.
+
+        Returns:
+            Prompt definition dict with name, description, arguments, and
+            icons (if provided and protocol_version supports it).
+
+        Example:
+            >>> prompts = PromptRegistry()
+            >>>
+            >>> @prompts.prompt()
+            >>> async def greet(username: str) -> list[dict]:
+            ...     '''Greet a user.'''
+            ...     return [{"role": "user", "content": f"Hello, {username}"}]
+            >>>
+            >>> defn = prompts.get_raw_prompts()[0]
+            >>> prompts.shape_prompt(defn)["name"]
+            'greet'
+        """
+        prompt_dict: dict[str, object] = {
+            "name": defn.name,
+            "description": defn.description,
+            "arguments": [
+                {
+                    "name": arg.name,
+                    "description": arg.description,
+                    "required": arg.required,
+                }
+                for arg in defn.arguments
+            ],
+        }
+        if defn.icons is not None and icons_supported(protocol_version):
+            prompt_dict["icons"] = [icon.model_dump(exclude_none=True) for icon in defn.icons]
+        return prompt_dict
+
+    def get_raw_prompts(self) -> list[PromptDefinition]:
+        """Return raw prompt definitions in registration order, unshaped.
+
+        Enables callers to paginate the raw registry before shaping items to
+        the wire format, so shaping cost is bounded by page size rather than
+        registry size.
+
+        Returns:
+            List of PromptDefinition objects in registration order.
+
+        Example:
+            >>> prompts = PromptRegistry()
+            >>>
+            >>> @prompts.prompt()
+            >>> async def greet(username: str) -> list[dict]:
+            ...     '''Greet a user.'''
+            ...     return [{"role": "user", "content": f"Hello, {username}"}]
+            >>>
+            >>> raw = prompts.get_raw_prompts()
+            >>> raw[0].name
+            'greet'
+        """
+        return list(self._prompts.values())
 
     async def get_prompt(
         self,

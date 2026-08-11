@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import get_args, get_origin
 
 from fastapi_mcp_router.exceptions import MCPError
+from fastapi_mcp_router.types import Icon
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +80,16 @@ class Resource:
         name: Human-readable resource name
         description: Human-readable resource description
         mime_type: Optional MIME type for the resource content
+        icons: Optional list of validated Icon descriptors. Only emitted in
+            resources/list for clients negotiating a protocol version that
+            supports icons.
     """
 
     uri: str
     name: str
     description: str
     mime_type: str | None = None
+    icons: list[Icon] | None = None
 
 
 @dataclass
@@ -96,12 +101,16 @@ class ResourceTemplate:
         name: Human-readable resource name
         description: Human-readable resource description
         mime_type: Optional MIME type for the resource content
+        icons: Optional list of validated Icon descriptors. Only emitted in
+            resources/templates/list for clients negotiating a protocol
+            version that supports icons.
     """
 
     uri_template: str
     name: str
     description: str
     mime_type: str | None = None
+    icons: list[Icon] | None = None
 
 
 @dataclass
@@ -214,6 +223,7 @@ class _ResourceDefinition:
         handler: Async callable that returns resource content
         pattern: Compiled regex for matching incoming URIs
         param_names: Ordered list of parameter names from the template
+        icons: Optional list of validated Icon descriptors
     """
 
     def __init__(
@@ -223,6 +233,7 @@ class _ResourceDefinition:
         description: str,
         handler: Callable,
         mime_type: str | None = None,
+        icons: list[Icon] | None = None,
     ) -> None:
         """Initialize resource definition.
 
@@ -232,11 +243,13 @@ class _ResourceDefinition:
             description: Resource description
             handler: Async callable implementing resource logic
             mime_type: Optional MIME type
+            icons: Optional list of validated Icon descriptors
         """
         self.uri_template = uri_template
         self.name = name
         self.description = description
         self.mime_type = mime_type
+        self.icons = icons
         self.handler = handler
         self.param_names, self.pattern = _compile_uri_template(uri_template)
 
@@ -557,6 +570,7 @@ class ResourceRegistry:
         name: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
+        icons: list[dict[str, object]] | None = None,
     ) -> Callable:
         """Decorator to register an async function as an MCP resource handler.
 
@@ -574,12 +588,19 @@ class ResourceRegistry:
             name: Resource name (defaults to function name)
             description: Resource description (defaults to function docstring)
             mime_type: Optional MIME type override
+            icons: Optional list of icon descriptor dicts. Each entry is
+                validated via Icon.model_validate() at registration time.
+                Only emitted in resources/list and resources/templates/list
+                for clients negotiating a protocol version that supports
+                icons.
 
         Returns:
             Decorator that returns the original function unchanged
 
         Raises:
             TypeError: If the decorated function is not async
+            pydantic.ValidationError: If an icon dict fails Icon validation
+                (e.g. src uses a disallowed scheme)
 
         Example:
             >>> @registry.resource(uri_template="config://{key}", name="Config")
@@ -595,6 +616,7 @@ class ResourceRegistry:
 
             resource_name = name or func_name
             resource_description = description or (getattr(func, "__doc__", None) or "").strip()
+            validated_icons = [Icon.model_validate(icon) for icon in icons] if icons is not None else None
 
             self._handlers.append(
                 _ResourceDefinition(
@@ -603,6 +625,7 @@ class ResourceRegistry:
                     description=resource_description,
                     handler=func,
                     mime_type=mime_type,
+                    icons=validated_icons,
                 )
             )
             return func
@@ -670,6 +693,7 @@ class ResourceRegistry:
                     name=defn.name,
                     description=defn.description,
                     mime_type=defn.mime_type,
+                    icons=defn.icons,
                 )
             )
 
@@ -704,6 +728,7 @@ class ResourceRegistry:
                 name=defn.name,
                 description=defn.description,
                 mime_type=defn.mime_type,
+                icons=defn.icons,
             )
             for defn in self._handlers
         ]
@@ -777,7 +802,7 @@ async def _invoke_handler(
         MCPError: -32603 if the handler raises an unexpected exception
         MCPError: -32603 if the handler returns an unsupported type
     """
-    # Resolve Depends() OUTSIDE try — exceptions propagate per EC-3
+    # Resolve Depends() OUTSIDE try — exceptions propagate
     from fastapi import Request
 
     call_kwargs: dict[str, object] = dict(kwargs)

@@ -621,10 +621,6 @@ In stateful mode, `MCPLoggingHandler` sends log messages to connected clients vi
 
 Log levels follow the MCP specification (ascending priority): `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`.
 
-## Roots
-
-`RootsManager` tracks server operation boundaries. Clients request roots via `roots/list` and receive a list of `Root` objects (URI + optional name). Roots define filesystem or resource locations the server may access.
-
 ## Server Info
 
 Customize server metadata returned in the `initialize` response:
@@ -646,7 +642,7 @@ mcp = MCPRouter(
 
 ## MCP Protocol Methods
 
-The router handles 17 MCP methods:
+The router participates in 17 MCP methods: 16 are dispatched inbound over JSON-RPC, and one (`sampling/createMessage`) is sent outbound by the server to the client.
 
 | Method | Type | Description |
 |--------|------|-------------|
@@ -654,13 +650,13 @@ The router handles 17 MCP methods:
 | `tools/list` | Request | Returns registered tools with JSON schemas |
 | `tools/call` | Request | Executes a tool with arguments |
 | `resources/list` | Request | Returns resources and URI templates |
+| `resources/templates/list` | Request | Returns registered resource URI templates |
 | `resources/read` | Request | Reads resource content by URI |
 | `resources/subscribe` | Request | Subscribes to resource changes (stateful) |
 | `resources/unsubscribe` | Request | Unsubscribes from resource changes |
 | `prompts/list` | Request | Returns registered prompts |
 | `prompts/get` | Request | Executes prompt with validated arguments |
-| `sampling/createMessage` | Request | Server-to-client LLM sampling (stateful) |
-| `roots/list` | Request | Returns registered operation boundaries |
+| `sampling/createMessage` | Outbound request | Server-to-client LLM sampling (stateful) |
 | `logging/setLevel` | Request | Sets minimum log level for the session |
 | `completion/complete` | Request | Returns argument completion suggestions |
 | `elicitation/create` | Request | Requests structured user input (stateful) |

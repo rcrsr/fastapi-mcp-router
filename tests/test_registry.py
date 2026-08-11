@@ -4,6 +4,7 @@ Tests MCPToolRegistry and ToolDefinition classes for tool registration,
 schema generation, tool listing, and tool execution across various scenarios.
 """
 
+import base64
 from typing import Literal, cast
 
 import pytest
@@ -1104,3 +1105,263 @@ async def test_call_tool_raises_mcp_error_on_non_argument_type_error():
 
     assert exc_info.value.code == -32603
     assert "Tool execution failed" in exc_info.value.message
+
+
+# title/icons tests
+
+
+@pytest.mark.unit
+def test_list_tools_includes_title_when_set():
+    """Test tool registered with a title emits it in list_tools()."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(title="Greeter")
+    async def greet_tool(name: str) -> str:
+        """Greet."""
+        return name
+
+    tools = registry.list_tools()
+
+    assert tools[0]["title"] == "Greeter"
+
+
+@pytest.mark.unit
+def test_list_tools_omits_title_when_not_set():
+    """Test tool registered without a title has no title key (never defaulted to name)."""
+    registry = MCPToolRegistry()
+
+    @registry.tool()
+    async def untitled_tool(name: str) -> str:
+        """No title."""
+        return name
+
+    tools = registry.list_tools()
+
+    assert "title" not in tools[0]
+
+
+@pytest.mark.unit
+def test_list_tools_format_includes_optional_fields_when_set():
+    """Test emitted dict carries name/description/title/inputSchema/annotations/outputSchema."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(
+        title="Analyzer",
+        annotations={"readOnlyHint": True, "title": "Analyze"},
+        output_schema={"type": "object", "properties": {}, "required": []},
+    )
+    async def analyze_tool(text: str) -> dict:
+        """Analyze text."""
+        return {}
+
+    tools = registry.list_tools()
+    tool = tools[0]
+
+    assert tool["name"] == "analyze_tool"
+    assert tool["description"] == "Analyze text."
+    assert tool["title"] == "Analyzer"
+    assert "inputSchema" in tool
+    tool_annotations = cast(dict, tool["annotations"])
+    assert tool_annotations["readOnlyHint"] is True
+    assert tool_annotations["title"] == "Analyze"
+    assert "outputSchema" in tool
+
+
+@pytest.mark.unit
+def test_list_tools_emits_all_typed_annotation_hints():
+    """Test readOnlyHint/destructiveHint/idempotentHint/openWorldHint all appear in annotations."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    )
+    async def risky_tool(value: str) -> str:
+        """Tool with all typed annotation hints."""
+        return value
+
+    tools = registry.list_tools()
+    tool_annotations = cast(dict, tools[0]["annotations"])
+
+    assert tool_annotations["readOnlyHint"] is False
+    assert tool_annotations["destructiveHint"] is True
+    assert tool_annotations["idempotentHint"] is True
+    assert tool_annotations["openWorldHint"] is True
+
+
+@pytest.mark.unit
+def test_list_tools_emits_icons_when_negotiated_version_supports_them():
+    """Test icons appear in tools/list when negotiated version is 2025-11-25."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(icons=[{"src": "https://example.com/icon.png"}])
+    async def icon_tool() -> str:
+        """Tool with icon."""
+        return "ok"
+
+    tools = registry.list_tools(protocol_version="2025-11-25")
+
+    assert tools[0]["icons"] == [{"src": "https://example.com/icon.png"}]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("protocol_version", [None, "2025-06-18", "2025-03-26"])
+def test_list_tools_omits_icons_below_negotiated_version(protocol_version):
+    """Test icons are omitted when negotiated version is below 2025-11-25."""
+    registry = MCPToolRegistry()
+
+    @registry.tool(icons=[{"src": "https://example.com/icon.png"}])
+    async def icon_tool() -> str:
+        """Tool with icon."""
+        return "ok"
+
+    tools = registry.list_tools(protocol_version=protocol_version)
+
+    assert "icons" not in tools[0]
+
+
+@pytest.mark.unit
+def test_list_tools_annotations_vendor_keys_round_trip_unchanged():
+    """Test unknown/vendor annotation keys pass through list_tools() verbatim, no error.
+
+    registry.py validates annotations via ToolAnnotations.model_validate() at
+    registration time, but ToolAnnotations allows extra fields (extra="allow"),
+    so an unrecognized key must survive unmodified with no exception raised.
+    """
+    registry = MCPToolRegistry()
+
+    @registry.tool(
+        annotations={
+            "readOnlyHint": True,
+            "vendor:acme:priority": "high",
+            "x-custom-flag": True,
+        }
+    )
+    async def annotated_tool(value: str) -> str:
+        """Tool with vendor-specific annotation keys."""
+        return value
+
+    tools = registry.list_tools()
+    tool_annotations = cast(dict, tools[0]["annotations"])
+
+    assert tool_annotations["vendor:acme:priority"] == "high"
+    assert tool_annotations["x-custom-flag"] is True
+    assert tool_annotations["readOnlyHint"] is True
+
+
+@pytest.mark.unit
+def test_list_tools_icons_vendor_keys_round_trip_unchanged():
+    """Test unknown/vendor keys inside an icon dict pass through list_tools() verbatim.
+
+    registry.py validates each icon dict against Icon at registration time
+    (MCPToolRegistry.tool()) but stores the original dict verbatim rather
+    than the validated model dump, so extra keys on an icon entry must
+    survive unmodified with no exception raised when the negotiated version
+    supports icons.
+    """
+    registry = MCPToolRegistry()
+
+    @registry.tool(icons=[{"src": "https://example.com/icon.png", "vendor:acme:tier": "gold"}])
+    async def icon_tool() -> str:
+        """Tool with a vendor-specific icon key."""
+        return "ok"
+
+    tools = registry.list_tools(protocol_version="2025-11-25")
+    icons = cast(list[dict], tools[0]["icons"])
+
+    assert icons[0]["src"] == "https://example.com/icon.png"
+    assert icons[0]["vendor:acme:tier"] == "gold"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "src,expected_scheme",
+    [
+        pytest.param("http://example.com/icon.png", "http", id="http-scheme"),
+        pytest.param("file:///etc/passwd", "file", id="file-scheme"),
+    ],
+)
+def test_tool_icon_with_disallowed_scheme_rejected_at_registration(src: str, expected_scheme: str):
+    """Test @registry.tool(icons=...) rejects a non-HTTPS/data: icon src fail-fast.
+
+    Proves Icon.model_validate() is actually invoked on the tool-icon
+    registration path: a disallowed-scheme src must raise before the
+    decorator returns, naming the disallowed scheme in the error.
+    """
+    from pydantic import ValidationError
+
+    registry = MCPToolRegistry()
+
+    with pytest.raises(ValidationError, match=expected_scheme):
+
+        @registry.tool(icons=[{"src": src}])
+        async def icon_tool() -> str:
+            """Tool with a disallowed icon scheme."""
+            return "ok"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            "data:text/html;base64," + base64.b64encode(b"<script>alert(1)</script>").decode(),
+            id="base64-html-script",
+        ),
+        pytest.param("data:,<script>alert(1)</script>", id="no-media-type-script"),
+        pytest.param("data:image/png,<script>alert(1)</script>", id="mismatched-media-type-script"),
+        pytest.param(
+            "data:image/svg+xml,<svg><script>alert(1)</script></svg>",
+            id="svg-script-tag",
+        ),
+    ],
+)
+def test_tool_icon_with_unsafe_svg_payload_rejected_at_registration(src: str):
+    """Test @registry.tool(icons=...) rejects an executable-content icon src fail-fast.
+
+    Proves the unconditional executable-content scan runs on the tool-icon
+    registration path regardless of the declared (or absent) media type.
+    """
+    from pydantic import ValidationError
+
+    registry = MCPToolRegistry()
+
+    with pytest.raises(ValidationError, match="executable content"):
+
+        @registry.tool(icons=[{"src": src}])
+        async def icon_tool() -> str:
+            """Tool with an unsafe icon payload."""
+            return "ok"
+
+
+@pytest.mark.unit
+def test_tool_icon_valid_https_and_data_uri_survive_registration_and_list_tools():
+    """Positive control: valid https:// and data: icons both register and reach list_tools() output.
+
+    Proves the registration-time validation wired in registry.py rejects
+    unsafe payloads without also rejecting well-formed ones, and that vendor
+    keys on each icon survive the round trip into list_tools() output.
+    """
+    registry = MCPToolRegistry()
+
+    @registry.tool(
+        icons=[
+            {"src": "https://example.com/icon.png", "vendor:acme:tier": "gold"},
+            {"src": "data:image/png;base64,aGVsbG8=", "vendor:acme:tier": "silver"},
+        ]
+    )
+    async def icon_tool() -> str:
+        """Tool with both a https and data: icon."""
+        return "ok"
+
+    tools = registry.list_tools(protocol_version="2025-11-25")
+    icons = cast(list[dict], tools[0]["icons"])
+
+    assert icons[0]["src"] == "https://example.com/icon.png"
+    assert icons[0]["vendor:acme:tier"] == "gold"
+    assert icons[1]["src"] == "data:image/png;base64,aGVsbG8="
+    assert icons[1]["vendor:acme:tier"] == "silver"

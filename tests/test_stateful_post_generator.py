@@ -147,7 +147,7 @@ async def test_stateful_post_generator_zero_items_returns_empty_list() -> None:
     async def empty_gen() -> AsyncGenerator[dict]:
         """Yield nothing."""
         return
-        yield  # make this an async generator  # noqa: unreachable
+        yield  # make this an async generator
 
     app = _make_stateful_app(registry)
     transport = httpx.ASGITransport(app=app)
