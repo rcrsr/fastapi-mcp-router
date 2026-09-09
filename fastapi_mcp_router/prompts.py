@@ -6,7 +6,6 @@ using inspect, supporting required and optional prompt arguments.
 
 Classes:
     PromptArgument: Data model for a single prompt argument descriptor
-    PromptMessage: Data model for a single prompt message
     PromptDefinition: Internal storage for prompt metadata
     PromptRegistry: Main registry for prompt registration and execution
 """
@@ -35,20 +34,6 @@ class PromptArgument:
     name: str
     description: str
     required: bool
-
-
-@dataclass
-class PromptMessage:
-    """A single message in a prompt response.
-
-    Attributes:
-        role: Speaker role; either "user" or "assistant"
-        content: Text content of the message; wrapped into a text content
-            block on the wire
-    """
-
-    role: str
-    content: str
 
 
 def _normalize_message(message: dict[str, object]) -> dict[str, object]:
@@ -376,11 +361,11 @@ class PromptRegistry:
                 result = await defn.handler(**call_args)
             else:
                 result = defn.handler(**call_args)
+            return [_normalize_message(message) for message in result]
         except MCPError:
             raise
         except Exception as e:
             raise MCPError(code=-32603, message=f"Prompt handler failed: {e}") from e
-        return [_normalize_message(message) for message in result]
 
     def has_prompts(self) -> bool:
         """Check if any prompts are registered.

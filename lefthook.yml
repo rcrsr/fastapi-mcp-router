@@ -6,10 +6,10 @@ pre-commit:
   parallel: true
   jobs:
     - name: ruff lint
-      glob: "*.py"
+      glob: "**/*.py"
       run: uv run ruff check {staged_files}
     - name: ruff format
-      glob: "*.py"
+      glob: "**/*.py"
       run: uv run ruff format --check {staged_files}
 
 commit-msg:

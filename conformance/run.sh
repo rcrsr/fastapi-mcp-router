@@ -32,13 +32,21 @@ uv run uvicorn conformance.app:app --host 127.0.0.1 --port "$PORT" --log-level w
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
+server_ready=0
 for _ in $(seq 1 60); do
   if curl -fsS -o /dev/null -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' \
       -d '{"jsonrpc":"2.0","id":0,"method":"ping"}' "$URL" 2>/dev/null; then
+    server_ready=1
     break
   fi
   sleep 0.25
 done
+
+if [ "$server_ready" -ne 1 ]; then
+  echo "ERROR: fixture server did not become ready at $URL within 15s." >&2
+  echo "See $RESULTS/server.log for details." >&2
+  exit 1
+fi
 
 run_suite() {
   npx -y "@modelcontextprotocol/conformance@${VERSION}" server \

@@ -1,9 +1,10 @@
 """Fixture server for the official MCP conformance suite.
 
 Exposes the tools, resources, and prompts that the server-side scenarios in
-``@modelcontextprotocol/conformance`` call by name. Every handler goes through
-the public ``fastapi_mcp_router`` API so that a failing scenario points at a
-library gap, not at fixture trickery.
+``@modelcontextprotocol/conformance`` call by name. Every handler uses only
+documented public and injection-only APIs (e.g. ``SamplingManager`` via
+constructor injection, per ``docs/guide.md``) so that a failing scenario
+points at a library gap, not at fixture trickery.
 
 Start with:  uvicorn conformance.app:app --port 3001
 Run suite:   bash conformance/run.sh
