@@ -307,7 +307,7 @@ The registry inspects the function signature:
 - Parameters with defaults become **optional** arguments
 - The `self` parameter is filtered out
 
-Both sync and async handlers are supported. The handler must return `list[dict]` where each dict has `role` ("user" or "assistant") and `content` (str) keys.
+Both sync and async handlers are supported. The handler must return `list[dict]` where each dict has `role` ("user" or "assistant") and `content` keys. A `str` content is wrapped as a `{"type": "text", "text": ...}` block on the wire. A `dict` content (text, image, audio, or embedded resource block) is forwarded unchanged, so a prompt can return an image or an embedded resource directly.
 
 ## Sessions and Stateful Mode
 

@@ -152,7 +152,7 @@ async def test_mcp_prompt_decorator_callable_via_http() -> None:
     assert "result" in body
     messages = body["result"]["messages"]
     assert len(messages) == 1
-    assert "Alice" in messages[0]["content"]
+    assert messages[0]["content"] == {"type": "text", "text": "Hello Alice"}
 
 
 # ---------------------------------------------------------------------------

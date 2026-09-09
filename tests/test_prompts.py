@@ -206,7 +206,7 @@ async def test_prompts_get_calls_handler_and_returns_messages() -> None:
     messages = body["result"]["messages"]
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
-    assert "Alice" in messages[0]["content"]
+    assert messages[0]["content"] == {"type": "text", "text": "Hello Alice"}
 
 
 @pytest.mark.integration
@@ -236,7 +236,32 @@ async def test_prompts_get_sync_handler_works() -> None:
     body = resp.json()
     messages = body["result"]["messages"]
     assert messages[0]["role"] == "assistant"
-    assert "AI" in messages[0]["content"]
+    assert messages[0]["content"] == {"type": "text", "text": "Topic: AI"}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prompts_get_dict_content_passed_through() -> None:
+    """Dict content blocks (image, resource) are forwarded unchanged."""
+    prompt_registry = PromptRegistry()
+    image_block = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+
+    @prompt_registry.prompt()
+    async def image_prompt() -> list[dict]:
+        """Prompt with an image block."""
+        return [{"role": "user", "content": image_block}]
+
+    app = build_app_with_prompts(prompt_registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/mcp",
+            json=make_jsonrpc("prompts/get", params={"name": "image_prompt"}),
+            headers=MCP_HEADERS,
+        )
+
+    messages = resp.json()["result"]["messages"]
+    assert messages[0]["content"] == image_block
 
 
 # ---------------------------------------------------------------------------

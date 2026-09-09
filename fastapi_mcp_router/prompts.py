@@ -43,11 +43,31 @@ class PromptMessage:
 
     Attributes:
         role: Speaker role; either "user" or "assistant"
-        content: Text content of the message
+        content: Text content of the message; wrapped into a text content
+            block on the wire
     """
 
     role: str
     content: str
+
+
+def _normalize_message(message: dict[str, object]) -> dict[str, object]:
+    """Wrap a string ``content`` into a text content block.
+
+    The MCP spec requires ``content`` to be a content object. Handlers may
+    return a plain string for convenience; dict content is passed through so
+    handlers can emit image, audio, or embedded-resource blocks directly.
+
+    Args:
+        message: Message dict with ``role`` and ``content`` keys
+
+    Returns:
+        Message dict whose ``content`` is a content-block dict
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return {**message, "content": {"type": "text", "text": content}}
+    return message
 
 
 class PromptDefinition:
@@ -319,7 +339,10 @@ class PromptRegistry:
             arguments: Dict of argument values keyed by argument name
 
         Returns:
-            List of message dicts with role and content keys
+            List of message dicts with role and content keys. A string
+            content is wrapped as ``{"type": "text", "text": ...}``; a dict
+            content (text, image, audio, or embedded resource block) is
+            forwarded unchanged.
 
         Raises:
             MCPError: code -32602 if prompt not found
@@ -353,11 +376,11 @@ class PromptRegistry:
                 result = await defn.handler(**call_args)
             else:
                 result = defn.handler(**call_args)
-            return result
         except MCPError:
             raise
         except Exception as e:
             raise MCPError(code=-32603, message=f"Prompt handler failed: {e}") from e
+        return [_normalize_message(message) for message in result]
 
     def has_prompts(self) -> bool:
         """Check if any prompts are registered.
