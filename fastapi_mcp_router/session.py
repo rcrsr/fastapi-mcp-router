@@ -37,7 +37,7 @@ from fastapi_mcp_router.exceptions import MCPError
 try:
     import redis.asyncio as _aioredis_runtime  # type: ignore[import-untyped]
 except ImportError:
-    _aioredis_runtime = None  # ty:ignore[invalid-assignment]
+    _aioredis_runtime = None
 
 
 class _AsyncRedisPipeline(Protocol):

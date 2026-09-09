@@ -1,0 +1,170 @@
+# =============================================================================
+# THE FASTAPI-MCP-ROUTER ISSUE TAXONOMY, in one place. Four axes; one is a
+# label set. The shape mirrors rcrsr/rill-cli (see its .github/labeler.yml);
+# the areas below are derived from THIS repository's module boundaries.
+#
+#   1. AREA (where) -- `area:*` labels, the glob map below. Path-derivable, so
+#      PRs get them automatically (actions/labeler via
+#      .github/workflows/pr-labels.yml). On issues the filer sets them.
+#      Pick ONE primary area, the one that owns the work, and add a second only
+#      when the work is genuinely co-owned. The PR labeler is additive and
+#      mechanical, so cross-cutting PRs collect one label per touched path.
+#      Nine areas, mapped to this repository's modules:
+#        area:router      MCP method dispatch and transport -- router.py,
+#                         protocol.py, exceptions.py. JSON-RPC framing,
+#                         Streamable HTTP / SSE, auth validation, PRM, version
+#                         negotiation, pagination, notifications.
+#        area:registry    tool registration and schema generation --
+#                         registry.py, types.py. Decorators, TypeAdapter
+#                         schemas, Depends/Request/BackgroundTasks injection,
+#                         content blocks, annotations, icons.
+#        area:resources   resource registry, providers, URI templates --
+#                         resources.py.
+#        area:prompts     prompt registry and argument metadata -- prompts.py.
+#        area:session     session stores, Redis, sampling, roots --
+#                         session.py.
+#        area:telemetry   optional OpenTelemetry tracing and metrics --
+#                         telemetry.py.
+#        area:conformance the official MCP conformance suite harness --
+#                         conformance/ (fixture app, runner, baseline).
+#        area:docs        documentation -- README, CHANGELOG, docs/, examples/.
+#        area:dx          CI, toolchain, hooks, and root config. Anything no
+#                         consumer of `fastapi-mcp-router` sees. A root deps
+#                         bump touches none of the source globs above, so it
+#                         would otherwise get no area.
+#
+#   2. STATUS (why not now) -- the `on-hold` label, issues-only, optional:
+#        on-hold       valid, shaped work deliberately parked. Not low priority
+#                      and not blocked-on-a-specific-issue.
+#      Blocked on a SPECIFIC issue: use the native issue dependency ("Mark as
+#      blocked by" in the sidebar) and NO label. Never duplicate a native
+#      relationship as a label.
+#
+#   3. TYPE (what kind) -- native org-level Issue Type, NOT a label, issues-only:
+#        Bug . Feature . Chore . Security . Idea
+#      Feature = net-new capability a library user can see: a new decorator
+#      argument, a new MCP method, a new exported type. Chore = robustness work
+#      on existing machinery: debt, refactors, tests, perf. Decision rule:
+#      "would a fastapi-mcp-router user notice it in a release note? Feature.
+#      Otherwise Chore." Bug = existing behavior is wrong: a wire shape that
+#      violates the spec, a schema that drops a field, a session that leaks.
+#      Security takes precedence when the issue is fundamentally about auth
+#      validation, untrusted tool input, icon/URI allowlists, or session
+#      isolation. Idea = captured but not yet shaped; still carries >=1 area.
+#      Documentation work is NOT a type: it is `area:docs` on a Bug, Feature,
+#      or Chore.
+#
+#   4. PRIORITY (how urgent) -- native org-level Priority Issue Field, NOT a
+#      label, issues-only, optional: High = the queue . Medium = this cycle .
+#      Low = someday. Unset = not yet triaged.
+#
+# TITLES: issues are titled `[<primary-area>] <title>`, lowercase, bare area
+# name without the `area:` prefix: "[session] Redis reconnect drops events".
+# PR titles keep conventional-commit format (`fix(session): ...`), where the
+# scope already names the primary area; they become main's squash subjects.
+#
+# COLORS: one signal per axis, label text is the load-bearing distinction
+# (WCAG 1.4.1). area:* uniform blue #1d76db; on-hold gray #d2dae1. Create them
+# with .github/scripts/sync-labels.sh.
+#
+# PRs carry only area labels; the linked issue holds Type/Priority/on-hold.
+# This file doubles as the one-stop taxonomy doc.
+# =============================================================================
+
+'area:router':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fastapi_mcp_router/router.py'
+          - 'fastapi_mcp_router/protocol.py'
+          - 'fastapi_mcp_router/exceptions.py'
+          - 'tests/test_router*.py'
+          - 'tests/test_mcp_router_class.py'
+          - 'tests/test_protocol.py'
+          - 'tests/test_exceptions.py'
+          - 'tests/test_streamable_http.py'
+          - 'tests/test_sse_*.py'
+          - 'tests/test_stateful_post_generator.py'
+          - 'tests/test_graceful_shutdown.py'
+          - 'tests/test_pagination.py'
+          - 'tests/test_capabilities.py'
+          - 'tests/test_prm.py'
+          - 'tests/test_security.py'
+          - 'tests/test_backwards_compat.py'
+          - 'tests/test_version.py'
+          - 'tests/test_handle_tools_list.py'
+          - 'tests/test_logging_protocol.py'
+          - 'tests/test_completions.py'
+          - 'tests/test_elicitation.py'
+          - 'tests/test_progress.py'
+
+'area:registry':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fastapi_mcp_router/registry.py'
+          - 'fastapi_mcp_router/types.py'
+          - 'tests/test_registry*.py'
+          - 'tests/test_types.py'
+          - 'tests/test_annotations.py'
+          - 'tests/test_output_schemas.py'
+          - 'tests/test_content_blocks.py'
+          - 'tests/test_docstrings.py'
+          - 'tests/test_request_injection.py'
+          - 'tests/test_background_tasks_injection.py'
+          - 'tests/test_streaming_tools.py'
+
+'area:resources':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fastapi_mcp_router/resources.py'
+          - 'tests/test_resources.py'
+          - 'tests/test_subscriptions.py'
+
+'area:prompts':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fastapi_mcp_router/prompts.py'
+          - 'tests/test_prompts.py'
+
+'area:session':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fastapi_mcp_router/session.py'
+          - 'tests/test_session*.py'
+          - 'tests/test_redis_session.py'
+          - 'tests/test_sampling.py'
+
+'area:telemetry':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fastapi_mcp_router/telemetry.py'
+          - 'tests/test_telemetry.py'
+
+'area:conformance':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'conformance/**'
+
+'area:docs':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'README.md'
+          - 'CHANGELOG.md'
+          - 'docs/**'
+          - 'examples/**'
+
+'area:dx':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - '.claude/**'
+          - 'tests/conftest.py'
+          - 'tests/__init__.py'
+          - 'tests/test_no_deprecation_warnings.py'
+          # Root toolchain inputs. A root-only deps bump touches none of the
+          # source globs above, so it would otherwise get no area at all.
+          - 'pyproject.toml'
+          - 'uv.lock'
+          - 'lefthook.yml'
+          - '.codannaignore'
+          - '.python-version'
+          - 'CLAUDE.md'
