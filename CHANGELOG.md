@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Typed content blocks:** `ImageContent`, `AudioContent`, and `ResourceLinkContent` join `TextContent` as exported tool-response types, emitted to clients on any supported protocol version — none of these are `2025-11-25`-only additions (image content dates to the first spec revision, audio to `2025-03-26`, and resource links to `2025-06-18`). ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
 - **Tool `title` and `ToolAnnotations`:** `@registry.tool()` accepts a human-readable `title` and typed annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
 - **`Icon` on all four carriers:** The `@tool`, `@resource`, and `@prompt` decorators accept `icons=[{"src": ..., "mimeType": ...}]`, and resource templates carry them too. Icons are validated at registration time against an HTTPS/`data:` scheme allowlist and an image MIME allowlist, and SVG sources are scanned for executable content across raw, percent-encoded, and base64 representations. This is a best-effort blocklist, not a sanitizer — apply CSP `script-src 'none'` or DOMPurify when rendering icons in a browser. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Release SOP:** Release procedures for version management, changelog, branching, and PyPI publishing. ([#13](https://github.com/rcrsr/fastapi-mcp-router/pull/13))
 
 ### Changed
 
