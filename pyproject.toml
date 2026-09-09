@@ -42,6 +42,8 @@ dev = [
     "twine==6.2.0",
     "ty==0.0.26",
     "fastapi-mcp-router[otel,redis]",
+    "lefthook==2.1.12",
+    "uvicorn==0.41.0",
 ]
 
 [build-system]

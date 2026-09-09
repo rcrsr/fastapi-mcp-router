@@ -1,0 +1,29 @@
+# Git hooks managed by lefthook (https://lefthook.dev).
+# Install once per clone:  uv run lefthook install
+# Bypass for one commit:   LEFTHOOK=0 git commit ...
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: ruff lint
+      glob: "*.py"
+      run: uv run ruff check {staged_files}
+    - name: ruff format
+      glob: "*.py"
+      run: uv run ruff format --check {staged_files}
+
+commit-msg:
+  jobs:
+    - name: conventional prefix
+      run: >-
+        head -1 {1} | grep -qE '^(Merge|Revert|fixup!|squash!)|^(feat|fix|docs|ci|test|chore|refactor|perf|build|release)(\([a-z0-9._-]+\))?!?: .+'
+        || { echo "commit-msg: first line must start with feat|fix|docs|ci|test|chore|refactor|perf|build|release, e.g. 'feat: add X'"; exit 1; }
+
+pre-push:
+  jobs:
+    - name: type check
+      run: uv run ty check .
+    - name: tests
+      run: uv run pytest -q
+    - name: conformance
+      run: bash conformance/run.sh

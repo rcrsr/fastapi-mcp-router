@@ -1,0 +1,27 @@
+# Expected failures for `bash conformance/run.sh`.
+#
+# Every entry is a documented library gap, not a fixture problem. The suite
+# exits 1 when a listed scenario starts passing, so remove the entry in the
+# same PR that closes the gap. Fixture: conformance/app.py.
+server:
+  # No public EmbeddedResource content block model; dict results are
+  # JSON-stringified into a text block instead of a `type: resource` block.
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+
+  # Streamable HTTP POST responses emit a single SSE frame with the result.
+  # notifications/progress is enqueued on the session and only drained by the
+  # GET stream poller (1s tick), so it arrives after the tools/call result.
+  - tools-call-with-progress
+
+  # No public handle for a tool to emit notifications/message.
+  - tools-call-with-logging
+
+  # SamplingManager.create_message() needs a session_id that a tool handler
+  # cannot obtain through the public API.
+  - tools-call-sampling
+
+  # No public API for a tool to issue elicitation/create.
+  - tools-call-elicitation
+  - elicitation-sep1034-defaults
+  - elicitation-sep1330-enums
