@@ -206,7 +206,7 @@ async def test_prompts_get_calls_handler_and_returns_messages() -> None:
     messages = body["result"]["messages"]
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
-    assert "Alice" in messages[0]["content"]
+    assert messages[0]["content"] == {"type": "text", "text": "Hello Alice"}
 
 
 @pytest.mark.integration
@@ -236,7 +236,76 @@ async def test_prompts_get_sync_handler_works() -> None:
     body = resp.json()
     messages = body["result"]["messages"]
     assert messages[0]["role"] == "assistant"
-    assert "AI" in messages[0]["content"]
+    assert messages[0]["content"] == {"type": "text", "text": "Topic: AI"}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prompts_get_dict_content_passed_through() -> None:
+    """Dict content blocks (image, resource) are forwarded unchanged."""
+    prompt_registry = PromptRegistry()
+    image_block = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+
+    @prompt_registry.prompt()
+    async def image_prompt() -> list[dict]:
+        """Prompt with an image block."""
+        return [{"role": "user", "content": image_block}]
+
+    app = build_app_with_prompts(prompt_registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/mcp",
+            json=make_jsonrpc("prompts/get", params={"name": "image_prompt"}),
+            headers=MCP_HEADERS,
+        )
+
+    messages = resp.json()["result"]["messages"]
+    assert messages[0]["content"] == image_block
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_prompt_non_iterable_result_wraps_as_mcp_error_32603() -> None:
+    """A handler returning a non-iterable result raises MCPError -32603."""
+    registry = PromptRegistry()
+
+    @registry.prompt()
+    async def bad_prompt() -> object:
+        """A prompt that returns a non-iterable result."""
+        return 42
+
+    with pytest.raises(MCPError) as exc_info:
+        await registry.get_prompt("bad_prompt", {})
+
+    assert exc_info.value.code == -32603
+    assert "Prompt handler failed" in exc_info.value.message
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_prompts_get_message_not_dict_returns_32603() -> None:
+    """prompts/get returns -32603 when a returned message isn't a dict."""
+    prompt_registry = PromptRegistry()
+
+    @prompt_registry.prompt()
+    async def malformed_prompt() -> list:
+        """A prompt that returns a message that isn't a dict."""
+        return ["not a dict"]
+
+    app = build_app_with_prompts(prompt_registry)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/mcp",
+            json=make_jsonrpc("prompts/get", params={"name": "malformed_prompt"}),
+            headers=MCP_HEADERS,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["error"]["code"] == -32603
+    assert "Prompt handler failed" in body["error"]["message"]
 
 
 # ---------------------------------------------------------------------------

@@ -50,3 +50,6 @@ uv.lock
 
 internal/
 
+
+# MCP conformance suite output
+conformance/results/

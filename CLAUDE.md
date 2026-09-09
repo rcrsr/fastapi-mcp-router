@@ -24,9 +24,20 @@ uv run pytest --no-cov
 
 # Build package
 uv run python -m build
+
+# Lint, format, type check (same commands CI runs)
+uv run ruff check . && uv run ruff format --check . && uv run ty check .
+
+# MCP conformance suite, spec 2025-11-25 and 2025-06-18 (needs Node.js; ~45s)
+bash conformance/run.sh
+
+# Install git hooks (once per clone)
+uv run lefthook install
 ```
 
-No separate lint or format commands are configured. No Makefile exists. The venv is managed by `uv` — use `uv run` to execute commands.
+No Makefile exists. The venv is managed by `uv` — use `uv run` to execute commands.
+
+Git hooks live in `lefthook.yml`: pre-commit runs ruff on staged files, commit-msg enforces a conventional prefix (`feat:`, `fix:`, `docs:`, `ci:`, ...), pre-push runs ty, pytest, and the conformance suite.
 
 ## Architecture
 
@@ -79,3 +90,4 @@ session.py, resources.py, prompts.py
 - Tests use `@pytest.mark.unit` and `@pytest.mark.integration` markers.
 - Async test functions use explicit `@pytest.mark.asyncio` decorator (`asyncio_mode = "auto"` is NOT configured).
 - Key test files: `test_streamable_http.py` (Streamable HTTP transport), `test_telemetry.py` (OTel), `test_sse_streaming.py` (legacy SSE).
+- `conformance/` runs the official MCP conformance suite against a public-API fixture server. `conformance/baseline.yml` lists known-failing scenarios with the library gap behind each; remove an entry when the gap closes or the suite fails.
