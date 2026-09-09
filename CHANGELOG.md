@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **MCP conformance suite:** `conformance/` runs the official `@modelcontextprotocol/conformance` server scenarios (spec `2025-11-25`) against a fixture app built from the public API, with a commented `baseline.yml` of known gaps. Wired into CI as the `conformance` job and into the `pre-push` hook.
-- **lefthook git hooks:** `lefthook.yml` gates commits on ruff lint and format for staged files plus a conventional commit-message prefix, and gates pushes on ty, pytest, and the conformance suite. Install with `uv run lefthook install`.
+- **MCP conformance suite:** `conformance/` runs the official `@modelcontextprotocol/conformance` server scenarios (spec `2025-11-25`) against a fixture app built from the public API, with a commented `baseline.yml` of known gaps. Wired into CI as the `conformance` job and into the `pre-push` hook. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
+- **lefthook git hooks:** `lefthook.yml` gates commits on ruff lint and format for staged files plus a conventional commit-message prefix, and gates pushes on ty, pytest, and the conformance suite. Install with `uv run lefthook install`. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
 
 - **MCP 2025-11-25 support:** Protocol revision `2025-11-25` is supported additively alongside `2025-06-18` and `2025-03-26`; clients negotiating an older revision see the same response shapes as 0.3.1, with the exception of pagination (see **Changed** below), which applies uniformly across all three negotiated revisions. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
 - **Version-negotiation clamping:** An unrecognized `protocolVersion` is now clamped down to the newest supported revision instead of rejected. An unclampable version returns JSON-RPC `-32602` with `data.supported` and `data.requested` at HTTP 200, replacing the former HTTP 400 plain-error body. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Prompt text content on the wire:** `prompts/get` now wraps a handler's `str` content as a `{"type": "text", "text": ...}` block as the spec requires, instead of forwarding a bare string that spec-strict clients rejected. Dict content blocks are forwarded unchanged. Surfaced by the `prompts-get-simple` conformance scenario.
+- **Prompt text content on the wire:** `prompts/get` now wraps a handler's `str` content as a `{"type": "text", "text": ...}` block as the spec requires, instead of forwarding a bare string that spec-strict clients rejected. Dict content blocks are forwarded unchanged. Surfaced by the `prompts-get-simple` conformance scenario. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
 
 ### Changed
 
