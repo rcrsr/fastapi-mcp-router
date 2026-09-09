@@ -143,10 +143,12 @@ Sets the router's internal shutdown event, signaling active SSE generator loops 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     await mcp.shutdown()
+
 
 app = FastAPI(lifespan=lifespan)
 ```
@@ -174,6 +176,7 @@ async MCPRouter.notify_resource_updated(uri: str) -> None
 ```python
 mcp = MCPRouter(session_store=InMemorySessionStore(), stateful=True)
 
+
 @mcp.tool()
 async def refresh_catalog() -> dict:
     """Reload the tool catalog and tell connected clients."""
@@ -181,9 +184,11 @@ async def refresh_catalog() -> dict:
     await mcp.notify_tools_list_changed()
     return {"status": "refreshed"}
 
+
 @mcp.resource("file:///data/report.txt")
 async def report() -> str:
     return "latest report contents"
+
 
 async def on_report_change() -> None:
     await mcp.notify_resource_updated("file:///data/report.txt")
@@ -361,10 +366,14 @@ app.include_router(create_prm_router(mcp=mcp))
 **Example — explicit metadata (backward-compatible):**
 
 ```python
-app.include_router(create_prm_router(oauth_resource_metadata={
-    "resource": "https://api.example.com/mcp",
-    "authorization_servers": ["https://auth.example.com"],
-}))
+app.include_router(
+    create_prm_router(
+        oauth_resource_metadata={
+            "resource": "https://api.example.com/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+        }
+    )
+)
 ```
 
 **Raises:**
@@ -452,9 +461,9 @@ Returns tool definitions in MCP format. Each dict contains:
 {
     "name": str,
     "description": str,
-    "inputSchema": dict,        # Always present
-    "annotations": dict | None, # Present when set
-    "outputSchema": dict | None # Present when set
+    "inputSchema": dict,  # Always present
+    "annotations": dict | None,  # Present when set
+    "outputSchema": dict | None,  # Present when set
 }
 ```
 
@@ -848,10 +857,12 @@ Only emitted on the wire when the connection's negotiated protocol version is `2
 ```python
 from fastapi_mcp_router import ImageContent
 
+
 @registry.tool()
 async def render_chart(data: list[float]) -> ImageContent:
     png_bytes = render_png(data)
     import base64
+
     return ImageContent(data=base64.b64encode(png_bytes).decode(), mimeType="image/png")
 ```
 
@@ -1007,6 +1018,7 @@ from fastapi_mcp_router import ToolAnnotations
 
 annotations = ToolAnnotations(readOnlyHint=True, title="Search Catalog")
 
+
 @registry.tool(annotations=annotations.model_dump(exclude_none=True))
 async def search_catalog(query: str) -> dict:
     """Search the product catalog without side effects."""
@@ -1027,7 +1039,7 @@ Type alias for SSE event source callbacks:
 
 ```python
 EventSubscriber = Callable[
-    [str, int | None],           # (session_id, last_event_id)
+    [str, int | None],  # (session_id, last_event_id)
     AsyncGenerator[tuple[int, dict]],  # yields (event_id, json_rpc_notification)
 ]
 ```

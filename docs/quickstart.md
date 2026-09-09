@@ -4,7 +4,7 @@ Install the package, register a tool, and serve it over HTTP in under 5 minutes.
 
 ## Prerequisites
 
-- Python 3.13+
+- Python 3.11+
 - FastAPI 0.134.0+
 - An ASGI server (uvicorn recommended)
 
@@ -28,10 +28,12 @@ from fastapi_mcp_router import MCPRouter
 app = FastAPI()
 mcp = MCPRouter()
 
+
 @mcp.tool()
 async def greet(name: str) -> str:
     """Greet a user by name."""
     return f"Hello, {name}!"
+
 
 app.include_router(mcp, prefix="/mcp")
 ```
@@ -127,6 +129,7 @@ Wrap the app with Mangum for Lambda (stateless mode only):
 
 ```python
 from mangum import Mangum
+
 handler = Mangum(app, lifespan="off")
 ```
 

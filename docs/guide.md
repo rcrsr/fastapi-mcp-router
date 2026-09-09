@@ -39,10 +39,12 @@ from fastapi_mcp_router import MCPRouter
 app = FastAPI()
 mcp = MCPRouter()
 
+
 @mcp.tool()
 async def search(query: str) -> list[dict]:
     """Search items."""
     return [{"id": 1, "match": query}]
+
 
 app.include_router(mcp, prefix="/mcp")
 ```
@@ -58,10 +60,12 @@ tools = MCPToolRegistry()
 resources = ResourceRegistry()
 prompts = PromptRegistry()
 
+
 @tools.tool()
 async def ping() -> str:
     """Health check."""
     return "pong"
+
 
 router = create_mcp_router(
     tools,
@@ -136,11 +140,13 @@ async def get_status() -> dict:
 Structured content enables typed tool results:
 
 ```python
-@mcp.tool(output_schema={
-    "type": "object",
-    "properties": {"score": {"type": "number"}},
-    "required": ["score"],
-})
+@mcp.tool(
+    output_schema={
+        "type": "object",
+        "properties": {"score": {"type": "number"}},
+        "required": ["score"],
+    }
+)
 async def analyze(text: str) -> dict:
     """Analyze text and return a score."""
     return {"score": 0.95}
@@ -166,6 +172,7 @@ These parameters are excluded from the generated JSON Schema. The LLM client nev
 from fastapi import Request, BackgroundTasks
 from fastapi_mcp_router import ProgressCallback
 
+
 @mcp.tool()
 async def process(
     data: str,
@@ -187,6 +194,7 @@ Return `AsyncGenerator[dict, None]` for incremental results:
 ```python
 from collections.abc import AsyncGenerator
 
+
 @mcp.tool()
 async def process_batch(items: list[str]) -> AsyncGenerator[dict, None]:
     """Process items one at a time."""
@@ -205,11 +213,14 @@ When a tool uses FastAPI `Depends()`, auto-generation cannot introspect the depe
 ```python
 from fastapi import Depends
 
-@mcp.tool(input_schema={
-    "type": "object",
-    "properties": {"message": {"type": "string"}},
-    "required": ["message"],
-})
+
+@mcp.tool(
+    input_schema={
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+    }
+)
 async def send(message: str, db=Depends(get_db)) -> dict:
     """Send a message."""
     await db.insert(message)
@@ -236,6 +247,7 @@ Parameters in `{braces}` map to function arguments. Resources without parameters
 async def current_time() -> str:
     """Return UTC timestamp."""
     from datetime import UTC, datetime
+
     return datetime.now(UTC).isoformat()
 ```
 
@@ -267,6 +279,7 @@ Implement the `ResourceProvider` ABC:
 
 ```python
 from fastapi_mcp_router.resources import ResourceProvider, Resource, ResourceContents
+
 
 class DatabaseProvider(ResourceProvider):
     def list_resources(self) -> list[Resource]:
@@ -372,6 +385,7 @@ Add `ProgressCallback` to a tool signature for long-running operations:
 ```python
 from fastapi_mcp_router import ProgressCallback
 
+
 @mcp.tool()
 async def train_model(dataset: str, progress: ProgressCallback) -> dict:
     """Train with progress reporting."""
@@ -397,14 +411,19 @@ Supply an `EventSubscriber` callback for application-driven server-to-client eve
 ```python
 from fastapi_mcp_router import EventSubscriber, MCPRouter, InMemorySessionStore
 
+
 async def my_events(session_id: str, last_event_id: int | None):
     """Yield (event_id, json_rpc_notification) tuples."""
     event_id = (last_event_id or 0) + 1
-    yield event_id, {
-        "jsonrpc": "2.0",
-        "method": "notifications/message",
-        "params": {"level": "info", "data": "heartbeat"},
-    }
+    yield (
+        event_id,
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "info", "data": "heartbeat"},
+        },
+    )
+
 
 mcp = MCPRouter(
     session_store=InMemorySessionStore(),
@@ -427,6 +446,7 @@ from typing import Any
 
 VALID_KEY = "sk-production-key"
 
+
 async def auth_validator(api_key: str | None, bearer_token: str | None) -> Any:
     if api_key:
         if not secrets.compare_digest(api_key, VALID_KEY):
@@ -436,6 +456,7 @@ async def auth_validator(api_key: str | None, bearer_token: str | None) -> Any:
         claims = await validate_oauth_token(bearer_token)  # returns dict or None
         return claims  # dict stored at request.state.auth_context
     return False
+
 
 mcp = MCPRouter(auth_validator=auth_validator)
 ```
@@ -471,10 +492,12 @@ Use `ToolFilter` to hide tools based on connection type:
 ```python
 from fastapi_mcp_router import ToolFilter
 
+
 def my_filter(is_oauth: bool) -> list[str] | None:
     if is_oauth:
         return ["admin_tool", "debug_tool"]  # Exclude from OAuth
     return None  # Include all for API key
+
 
 mcp = MCPRouter(tool_filter=my_filter)
 ```
@@ -488,11 +511,13 @@ Expose an RFC 9728 PRM endpoint for OAuth 2.1 discovery:
 ```python
 from fastapi_mcp_router import create_prm_router
 
-prm = create_prm_router({
-    "resource": "https://api.example.com/mcp",
-    "authorization_servers": ["https://auth.example.com"],
-    "scopes_supported": ["mcp:read", "mcp:evaluate"],
-})
+prm = create_prm_router(
+    {
+        "resource": "https://api.example.com/mcp",
+        "authorization_servers": ["https://auth.example.com"],
+        "scopes_supported": ["mcp:read", "mcp:evaluate"],
+    }
+)
 app.include_router(prm)  # Mounts at /.well-known/oauth-protected-resource
 ```
 
@@ -505,9 +530,11 @@ Pass a FastAPI dependency for rate limiting:
 ```python
 from fastapi import HTTPException
 
+
 async def rate_limit():
     if over_limit():
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
 
 mcp = MCPRouter(rate_limit_dependency=rate_limit)
 ```
@@ -569,6 +596,7 @@ Server-to-client LLM sampling lets a tool ask the connected client to perform an
 ```python
 from fastapi_mcp_router.session import SamplingManager
 
+
 @mcp.tool()
 async def ask_llm(question: str, sampler: SamplingManager) -> dict:
     """Ask the client's LLM a question."""
@@ -599,6 +627,7 @@ async def complete(ref: dict, argument: dict) -> dict:
         matches = [l for l in ["python", "rust", "go"] if l.startswith(prefix)]
         return {"values": matches, "hasMore": False}
     return {"values": []}
+
 
 router = create_mcp_router(tools, completion_handler=complete)
 ```

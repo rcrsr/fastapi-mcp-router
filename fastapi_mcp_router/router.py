@@ -1569,7 +1569,7 @@ def create_mcp_router(
 
             # create OTel span for tools/call when tracer is available.
             # span creation failure must not break request handling.
-            _tracer_any = cast(Any, _tracer)
+            _tracer_any = _tracer
             _span_cm: Any = None
             _span: Any = None
             if _tracer_any is not None:

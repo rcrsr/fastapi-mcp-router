@@ -32,18 +32,22 @@ from fastapi_mcp_router import MCPRouter
 app = FastAPI()
 mcp = MCPRouter()
 
+
 @mcp.tool()
 async def write_message(payload: str) -> dict:
     """Write coordination message."""
     return {"success": True, "message_id": "msg-123"}
 
+
 @mcp.resource("project://{project_id}/config")
 async def project_config(project_id: str) -> dict:
     return {"project_id": project_id, "env": "production"}
 
+
 @mcp.prompt()
 async def review_code(file_path: str, language: str = "python") -> list[dict]:
     return [{"role": "user", "content": f"Review {file_path} ({language})"}]
+
 
 app.include_router(mcp, prefix="/mcp")
 ```
