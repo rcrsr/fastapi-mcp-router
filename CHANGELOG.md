@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This removes functionality that was never spec-conformant: the MCP specification defines `roots/list` as a request the *server* sends to the *client* to discover the client's workspace roots — a client capability, not an inbound method a server handles. This library's server-hosted implementation inverted that direction. Roots itself is deprecated as of the `2026-07-28` MCP specification revision, with implementations encouraged to migrate toward passing directories or files via tool parameters, resource URIs, or server configuration instead. No server-side replacement is offered here — that is intentional, since a conformant client-hosted roots capability is outside this server library's scope.
 
   This ships as a `0.4.0` minor release rather than a major version because the project is still in SemVer's `0.x` initial-development phase, where the public API is explicitly unstable and a disclosed breaking change may ship in a minor release. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
+- **Dependency and CI maintenance:** Lowered fastapi and pydantic minimums, added lowest-direct CI job, and SHA-pinned GitHub Actions. ([#15](https://github.com/rcrsr/fastapi-mcp-router/pull/15))
 
 ## [0.3.1] - 2026-04-07
 
