@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-08
+
 ### Added
 
 - **MCP conformance suite:** `conformance/` runs the official `@modelcontextprotocol/conformance` server scenarios (spec `2025-11-25` and `2025-06-18`) against a fixture app built from the public API, with a commented `baseline.yml` of known gaps. Wired into CI as the `conformance` job and into the `pre-push` hook. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
