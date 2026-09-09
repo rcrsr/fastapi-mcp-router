@@ -5,7 +5,7 @@ Install the package, register a tool, and serve it over HTTP in under 5 minutes.
 ## Prerequisites
 
 - Python 3.11+
-- FastAPI 0.134.0+
+- FastAPI 0.115.0+
 - An ASGI server (uvicorn recommended)
 
 ## Install
