@@ -58,6 +58,9 @@ jobs:
 
   conformance:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        spec-version: ['2025-11-25', '2025-06-18']
 
     steps:
       - uses: actions/checkout@v4
@@ -77,12 +80,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
-      - name: MCP conformance suite
+      - name: MCP conformance suite (${{ matrix.spec-version }})
         run: bash conformance/run.sh
+        env:
+          CONFORMANCE_SPEC_VERSIONS: ${{ matrix.spec-version }}
 
       - name: Upload conformance results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-results
+          name: conformance-results-${{ matrix.spec-version }}
           path: conformance/results

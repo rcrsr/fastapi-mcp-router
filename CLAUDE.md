@@ -28,7 +28,7 @@ uv run python -m build
 # Lint, format, type check (same commands CI runs)
 uv run ruff check . && uv run ruff format --check . && uv run ty check .
 
-# MCP conformance suite (needs Node.js; ~30s)
+# MCP conformance suite, spec 2025-11-25 and 2025-06-18 (needs Node.js; ~45s)
 bash conformance/run.sh
 
 # Install git hooks (once per clone)

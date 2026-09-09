@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **MCP conformance suite:** `conformance/` runs the official `@modelcontextprotocol/conformance` server scenarios (spec `2025-11-25`) against a fixture app built from the public API, with a commented `baseline.yml` of known gaps. Wired into CI as the `conformance` job and into the `pre-push` hook. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
+- **MCP conformance suite:** `conformance/` runs the official `@modelcontextprotocol/conformance` server scenarios (spec `2025-11-25` and `2025-06-18`) against a fixture app built from the public API, with a commented `baseline.yml` of known gaps. Wired into CI as the `conformance` job and into the `pre-push` hook. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
 - **lefthook git hooks:** `lefthook.yml` gates commits on ruff lint and format for staged files plus a conventional commit-message prefix, and gates pushes on ty, pytest, and the conformance suite. Install with `uv run lefthook install`. ([#14](https://github.com/rcrsr/fastapi-mcp-router/pull/14))
 
 - **MCP 2025-11-25 support:** Protocol revision `2025-11-25` is supported additively alongside `2025-06-18` and `2025-03-26`; clients negotiating an older revision see the same response shapes as 0.3.1, with the exception of pagination (see **Changed** below), which applies uniformly across all three negotiated revisions. ([#12](https://github.com/rcrsr/fastapi-mcp-router/pull/12))
