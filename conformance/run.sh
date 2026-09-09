@@ -34,8 +34,11 @@ trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
 server_ready=0
 for _ in $(seq 1 60); do
-  if curl -fsS -o /dev/null -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' \
-      -d '{"jsonrpc":"2.0","id":0,"method":"ping"}' "$URL" 2>/dev/null; then
+  # A bare ping without Mcp-Session-Id is expected to 400 (session required);
+  # any HTTP response at all means uvicorn is up and routing requests.
+  status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' \
+      -d '{"jsonrpc":"2.0","id":0,"method":"ping"}' "$URL" 2>/dev/null || echo "000")
+  if [ "$status" != "000" ]; then
     server_ready=1
     break
   fi
