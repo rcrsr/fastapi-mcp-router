@@ -33,14 +33,14 @@ Issues = "https://github.com/rcrsr/fastapi-mcp-router/issues"
 otel = ["opentelemetry-api>=1.0"]
 redis = ["redis>=5.0"]
 dev = [
-    "build==1.6.0",
+    "build==1.6.1",
     "httpx==0.28.1",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
-    "ruff==0.16.6",
+    "ruff==0.16.7",
     "twine==7.0.0",
-    "ty==0.0.79",
+    "ty==0.0.80",
     "fastapi-mcp-router[otel,redis]",
     "lefthook==2.1.12",
     "uvicorn==0.52.4",
